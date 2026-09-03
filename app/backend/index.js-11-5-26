@@ -1,0 +1,1824 @@
+require('dotenv').config();
+const express = require('express');
+// const axios = require('axios');
+const axios = require('./httpClient');
+const bodyParser = require('body-parser');
+const cors = require('cors');
+const { Sequelize, DataTypes } = require('sequelize');
+const https = require('https');
+const fs = require('fs');
+
+const path = require('path');
+const { pipeline } = require('stream');
+const Busboy = require('busboy');
+const routes = require("./routes");
+
+const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
+
+const app = express();
+app.use(bodyParser.json());
+app.use(cors());
+const {
+  DB_HOST,
+  DB_USER,
+  DB_PASSWORD,
+  DB_NAME,
+  DB_PORT,
+  ECDWID_API_URL,
+  SSL_KEY_PATH,
+  SSL_CERT_PATH,
+  PORT,
+  HTTPS_PORT
+} = process.env;
+
+// SSL configuration
+const sslOptions = {
+  key: fs.readFileSync(SSL_KEY_PATH),
+  cert: fs.readFileSync(SSL_CERT_PATH)
+};
+
+// Sequelize setup
+const sequelize = new Sequelize(DB_NAME, DB_USER, DB_PASSWORD, {
+  host: DB_HOST,
+  dialect: 'mysql',
+  port: DB_PORT || 3306,
+});
+
+const Token = sequelize.define('Token', {
+  store_id: {
+    type: DataTypes.STRING,
+    allowNull: false,
+    primaryKey: true
+  },
+  details: {
+    type: DataTypes.JSON,
+    allowNull: false
+  }
+}, { timestamps: false });
+
+const Bundle = sequelize.define('Bundle', {
+  name: { type: DataTypes.STRING, allowNull: false },
+  product_ids: { type: DataTypes.STRING, allowNull: false },
+  store_id: { type: DataTypes.STRING, allowNull: false },
+  discount: { type: DataTypes.FLOAT, allowNull: false },
+  sku: { type: DataTypes.STRING, allowNull: false },
+  quantity: { type: DataTypes.INTEGER, defaultValue: 1 },
+  price: { type: DataTypes.FLOAT, allowNull: false },
+  costPrice: { type: DataTypes.FLOAT, allowNull: false },
+  ecwid_id: { type: DataTypes.INTEGER, allowNull: true }
+}, { timestamps: false });
+
+const Notification = sequelize.define('notification', {
+  details: { type: DataTypes.STRING, allowNull: false },
+  store_id: { type: DataTypes.STRING, allowNull: false },
+  read_flag: { type: DataTypes.BOOLEAN, allowNull: false },
+}, { timestamps: true });
+
+
+const Bill = sequelize.define('bills', {
+  bill_id: { type: DataTypes.INTEGER, autoIncrement: true, primaryKey: true },
+  store_id: { type: DataTypes.INTEGER, allowNull: false },
+  url: { type: DataTypes.STRING(2000), allowNull: false },
+  trans_id: { type: DataTypes.STRING(100), allowNull: false },
+  status: { type: DataTypes.ENUM('Pending', 'Paid', 'Failed'), allowNull: false, defaultValue: 'Pending' },
+  tans_data: { type: DataTypes.TEXT },
+  due_date: { type: DataTypes.DATEONLY, allowNull: false },
+  amount: { type: DataTypes.FLOAT, allowNull: false },
+  created_at: { type: DataTypes.DATE, allowNull: false, defaultValue: Sequelize.NOW },
+  updated_at: { type: DataTypes.DATE, allowNull: false, defaultValue: Sequelize.NOW }
+}, { timestamps: false });
+
+const StoreDetail = sequelize.define('storedetails', {
+  det_id: { type: DataTypes.INTEGER, autoIncrement: true, primaryKey: true },
+  store_id: { type: DataTypes.INTEGER, allowNull: false },
+  billing_name: { type: DataTypes.STRING(100), allowNull: false },
+  billing_email: { type: DataTypes.STRING(255), allowNull: false },
+  billing_phone: { type: DataTypes.STRING(40), allowNull: false },
+  billing_address: { type: DataTypes.STRING(500), allowNull: false },
+  billing_country: { type: DataTypes.STRING(100), allowNull: false },
+  billing_date: { type: DataTypes.DATEONLY, allowNull: false },
+  current_package: { type: DataTypes.INTEGER, allowNull: false },
+  trial: { type: DataTypes.BOOLEAN, allowNull: false, defaultValue: 0 },
+  active: { type: DataTypes.BOOLEAN, allowNull: false, defaultValue: 1 },
+  created_at: { type: DataTypes.DATE, allowNull: false, defaultValue: Sequelize.NOW },
+  updated_at: { type: DataTypes.DATE, allowNull: false, defaultValue: Sequelize.NOW }
+}, { timestamps: false });
+
+const Package = sequelize.define('packages', {
+  package_id: { type: DataTypes.INTEGER, autoIncrement: true, primaryKey: true },
+  package: { type: DataTypes.STRING(300), allowNull: false },
+  details: { type: DataTypes.STRING(500), allowNull: false },
+  price: { type: DataTypes.DECIMAL(10,0), allowNull: false },
+  trial_days: { type: DataTypes.INTEGER, allowNull: false }
+}, { timestamps: false });
+
+const Option = sequelize.define('Option', {
+  id: {
+    type: DataTypes.INTEGER,
+    primaryKey: true,
+    autoIncrement: true,
+  },
+  name: {
+    type: DataTypes.STRING,
+    allowNull: false,
+  },
+  type: {
+    type: DataTypes.STRING,
+    allowNull: false,
+  },
+  values: {
+    type: DataTypes.JSON, // Store values as a JSON array
+    allowNull: false,
+  },
+  default_value: {
+    type: DataTypes.STRING,
+    allowNull: true,
+  },
+  required: {
+    type: DataTypes.BOOLEAN,
+    defaultValue: false,
+  },
+  store_id: {
+    type: DataTypes.STRING,
+    allowNull: false,
+  },
+}, {
+  timestamps: false, // Disable createdAt and updatedAt
+});
+
+sequelize.sync(); // Synchronize models with the database
+
+
+const uploadsDir = path.join(__dirname, 'downloads');
+if (!fs.existsSync(uploadsDir)) {
+  fs.mkdirSync(uploadsDir);
+}
+
+app.post('/api/upload-image', (req, res) => {
+  const busboy = Busboy({ headers: req.headers }); // No 'new' keyword here
+  let fileUrl = '';
+
+  busboy.on('file', (fieldname, file, filename, encoding, mimetype) => {
+    // Only process image files
+    /*if (!mimetype.startsWith('image/')) {
+      return res.status(400).json({ error: 'File must be an image' });
+    }*/
+
+    const filePath = path.join(uploadsDir, `${Date.now()}`);
+    fileUrl = `/downloads/${path.basename(filePath)}`;
+
+
+    // Pipe the file stream into the local file system
+    const writeStream = fs.createWriteStream(filePath);
+    pipeline(file, writeStream, (err) => {
+      if (err) {
+        console.error('File upload failed:', err);
+        return res.status(500).json({ error: 'Failed to upload image' });
+      }
+    });
+  });
+
+  busboy.on('finish', () => {
+    if (!fileUrl) {
+      return res.status(400).json({ error: 'No file uploaded' });
+    }
+    // Return the image URL in the response
+    res.json({ imageUrl: 'https://app.bundlefix.com/backend'+fileUrl });
+  });
+
+  req.pipe(busboy); // Pipe the incoming request to busboy
+});
+
+// API Token Middleware
+app.use((req, res, next) => {
+  const authHeader = req.headers['authorization'];
+  if (authHeader && authHeader.startsWith('Bearer ')) {
+    req.apiToken = authHeader.slice(7);
+    req.storeId = req.headers['store_id'];
+  }
+  next();
+});
+
+// Fetch products from Ecwid
+app.get('/api/products', async (req, res) => {
+  try {
+    const response = await axios.get(`${ECDWID_API_URL}/${req.storeId}/products`, {
+      headers: { Authorization: `Bearer ${req.apiToken}` }
+    });
+    res.json(response.data);
+  } catch (error) {
+    res.status(500).json({ error: error });
+  }
+});
+
+// Fetch products from Ecwid
+app.get('/api/product/:id', async (req, res) => {
+  const { id } = req.params;
+  try {
+    const response = await axios.get(`${ECDWID_API_URL}/${req.storeId}/products/${id}`, {
+      headers: { Authorization: `Bearer ${req.apiToken}` }
+    });
+    res.json(response.data);
+  } catch (error) {
+    res.status(500).json({ error: error });
+  }
+});
+
+// Update product options
+app.put('/api/product/:id', async (req, res) => {
+  const { id } = req.params;
+  const { options } = req.body;
+  try {
+    const response = await axios.put(`https://app.ecwid.com/api/v3/${req.storeId}/products/${id}`, { options }, {
+      headers: { Authorization: `Bearer ${req.apiToken}` }
+    });
+    res.json(response.data);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Update product variations
+/*app.put('/api/product/:id/combinations', async (req, res) => {
+  const { id } = req.params;
+  const { combinations } = req.body;
+  try {
+    const response = await axios.put(`https://app.ecwid.com/api/v3/${req.storeId}/products/${id}/combinations`, { combinations }, {
+      headers: { Authorization: `Bearer ${req.apiToken}` }
+    });
+    res.json(response.data);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});*/
+
+// Get product count between dates
+app.get('/api/products/count', async (req, res) => {
+  try {
+    const { from, to } = req.query;
+    if (!from || !to) {
+      return res.status(400).json({ error: 'Both from and to dates are required' });
+    }
+
+    // Validate dates
+    const startDate = new Date(from);
+    const endDate = new Date(to);
+    if (isNaN(startDate) || isNaN(endDate)) {
+      return res.status(400).json({ error: 'Invalid date format. Use YYYY-MM-DD' });
+    }
+    if (startDate > endDate) {
+      return res.status(400).json({ error: 'from date cannot be after to date' });
+    }
+
+    // Convert to Ecwid timestamps (seconds)
+    const createdFrom = Math.floor(startDate.getTime() / 1000);
+    const createdTo = Math.floor(endDate.getTime() / 1000) + 86399; // End of day
+
+    const response = await axios.get(`${ECDWID_API_URL}/${req.storeId}/products`, {
+      headers: { Authorization: `Bearer ${req.apiToken}` },
+      params: {
+        createdFrom,
+        createdTo,
+        limit: 0 // Get only total count
+      }
+    });
+
+    res.json({
+      count: response.data.total,
+      from: startDate.toISOString(),
+      to: endDate.toISOString()
+    });
+  } catch (error) {
+    handleApiError(error, res);
+  }
+});
+
+// NEW: Get graph data grouped by date with revenue, profit and total (shipping)
+app.get('/api/graph', async (req, res) => {
+  try {
+    const { from, to } = req.query;
+
+    // Validate input
+    if (!from || !to) {
+      return res.status(400).json({ error: 'Both "from" and "to" dates are required' });
+    }
+
+    const startDate = new Date(from);
+    const endDate = new Date(to);
+
+    if (isNaN(startDate.getTime()) || isNaN(endDate.getTime())) {
+      return res.status(400).json({ error: 'Invalid date format. Use YYYY-MM-DD.' });
+    }
+
+    if (startDate > endDate) {
+      return res.status(400).json({ error: '"from" date cannot be after "to" date.' });
+    }
+
+    // Format timestamps for Ecwid API (as UNIX time)
+    const createdFrom = Math.floor(startDate.getTime() / 1000);
+    const createdTo = Math.floor(endDate.getTime() / 1000) + 86399;
+
+    // Helper to extract YYYY-MM-DD from ISO date
+    const formatDate = (isoString) => {
+      const date = new Date(isoString);
+      if (isNaN(date.getTime())) return null;
+      return date.toISOString().split('T')[0]; // YYYY-MM-DD
+    };
+
+    const groups = {};
+    const limit = 100;
+    let offset = 0;
+
+    while (true) {
+      const response = await axios.get(`${ECDWID_API_URL}/${req.storeId}/orders`, {
+        headers: { Authorization: `Bearer ${req.apiToken}` },
+        params: {
+          createdFrom,
+          createdTo,
+          limit,
+          offset,
+        },
+      });
+
+      const orders = response.data.items || [];
+      if (orders.length === 0) break;
+
+      orders.forEach(order => {
+        const dateKey = formatDate(order.createDate); // Use ISO string
+
+        if (!dateKey) return;
+
+        const total = parseFloat(order.total) || 0;
+        const tax = parseFloat(order.tax) || 0;
+        const shipping = parseFloat(order.shipping) || 0;
+
+        const revenue = total - tax - shipping;
+
+        if (!groups[dateKey]) {
+          groups[dateKey] = { revenue: 0, shipping: 0 };
+        }
+
+        groups[dateKey].revenue += revenue;
+        groups[dateKey].shipping += shipping;
+      });
+
+      offset += limit;
+    }
+
+    // Final formatted output
+    const result = Object.entries(groups)
+        .sort(([a], [b]) => new Date(a) - new Date(b))
+        .map(([date, { revenue, shipping }]) => ({
+          date,
+          revenue: Number(revenue.toFixed(2)),
+          profit: Number((revenue - shipping).toFixed(2)),
+          total: Number(shipping.toFixed(2)), // shipping as "total"
+        }));
+
+    res.json(result);
+  } catch (error) {
+    console.error('API /api/graph error:', error.message);
+    handleApiError(error, res);
+  }
+});
+
+app.get('/api/products-stats', async (req, res) => {
+  try {
+    const { from, to } = req.query;
+
+    if (!from || !to) {
+      return res.status(400).json({ error: 'Both "from" and "to" dates are required' });
+    }
+
+    const startDate = new Date(from);
+    const endDate = new Date(to);
+
+    if (isNaN(startDate.getTime()) || isNaN(endDate.getTime())) {
+      return res.status(400).json({ error: 'Invalid date format. Use YYYY-MM-DD.' });
+    }
+
+    if (startDate > endDate) {
+      return res.status(400).json({ error: '"from" date cannot be after "to" date.' });
+    }
+
+    const createdFrom = Math.floor(startDate.getTime() / 1000);
+    const createdTo = Math.floor(endDate.getTime() / 1000) + 86399;
+
+    const productStats = {};
+    const limit = 100;
+    let offset = 0;
+
+    while (true) {
+      const response = await axios.get(`${ECDWID_API_URL}/${req.storeId}/orders`, {
+        headers: { Authorization: `Bearer ${req.apiToken}` },
+        params: {
+          createdFrom,
+          createdTo,
+          limit,
+          offset,
+        },
+      });
+
+      const orders = response.data.items || [];
+      if (orders.length === 0) break;
+
+      orders.forEach(order => {
+        const orderShipping = parseFloat(order.shipping) || 0;
+        const orderTax = parseFloat(order.tax) || 0;
+
+        const items = order.items || [];
+        const itemCount = items.length;
+
+        const shippingPerItem = itemCount > 0 ? orderShipping / itemCount : 0;
+        const taxPerItem = itemCount > 0 ? orderTax / itemCount : 0;
+
+        items.forEach(item => {
+          const quantity = item.quantity || 0;
+          const price = parseFloat(item.price) || 0;
+          const productName = item.name || 'Unnamed Product';
+
+          if (!productStats[productName]) {
+            productStats[productName] = {
+              productName,
+              quantitySold: 0,
+              productCost: 0,
+              revenue: 0,
+              shipping: 0,
+              tax: 0,
+            };
+          }
+
+          const revenue = price * quantity;
+          const shipping = shippingPerItem;
+          const tax = taxPerItem;
+
+          productStats[productName].quantitySold += quantity;
+          productStats[productName].productCost += (item.costPrice * quantity);
+          productStats[productName].revenue += revenue;
+          productStats[productName].shipping += shipping;
+          productStats[productName].tax += tax;
+        });
+      });
+
+      offset += limit;
+    }
+
+    const result = Object.values(productStats).map(p => ({
+      productName: p.productName,
+      quantitySold: p.quantitySold,
+      shipping: Number(p.shipping.toFixed(2)),
+      tax: Number(p.tax.toFixed(2)),
+      productCost: Number(p.productCost.toFixed(2)),
+      revenue: Number(p.revenue.toFixed(2)),
+      profit: Number((p.revenue - p.productCost - p.shipping - p.tax).toFixed(2)),
+    }));
+
+    res.json(result);
+  } catch (error) {
+    console.error('API /api/products-graph error:', error.message);
+    handleApiError(error, res);
+  }
+});
+
+
+
+// Get orders total between dates
+app.get('/api/orders/total', async (req, res) => {
+  try {
+    const { from, to } = req.query;
+    if (!from || !to) {
+      return res.status(400).json({ error: 'Both from and to dates are required' });
+    }
+
+    // Validate dates
+    const startDate = new Date(from);
+    const endDate = new Date(to);
+    if (isNaN(startDate) || isNaN(endDate)) {
+      return res.status(400).json({ error: 'Invalid date format. Use YYYY-MM-DD' });
+    }
+    if (startDate > endDate) {
+      return res.status(400).json({ error: 'from date cannot be after to date' });
+    }
+
+    // Convert to Ecwid timestamps
+    const createdFrom = Math.floor(startDate.getTime() / 1000);
+    const createdTo = Math.floor(endDate.getTime() / 1000) + 86399;
+
+    let totalAmount = 0;
+    let totalTax = 0;
+    let totalShipping = 0;
+    let totalRevenue = 0;
+    let offset = 0;
+    const limit = 100;
+
+    while (true) {
+      const response = await axios.get(`${ECDWID_API_URL}/${req.storeId}/orders`, {
+        headers: { Authorization: `Bearer ${req.apiToken}` },
+        params: {
+          createdFrom,
+          createdTo,
+          limit,
+          offset
+        }
+      });
+
+      const orders = response.data.items;
+      if (orders.length === 0) break;
+
+      // Process each order
+      orders.forEach(order => {
+        const orderTotal = parseFloat(order.total) || 0;
+        const orderTax = parseFloat(order.tax) || 0;
+        const orderShipping = parseFloat(order.shipping) || 0;
+
+        totalAmount += orderTotal;
+        totalTax += orderTax;
+        totalShipping += orderShipping;
+        totalRevenue += orderTotal - orderTax - orderShipping;
+      });
+
+      offset += limit;
+    }
+
+    const profit = totalRevenue - totalShipping; // Adjust this calculation based on your business logic
+
+    res.json({
+      total: totalAmount.toFixed(2),
+      tax: totalTax.toFixed(2),
+      shipping: totalShipping.toFixed(2),
+      revenue: totalRevenue.toFixed(2),
+      profit: profit.toFixed(2),
+      from: startDate.toISOString(),
+      to: endDate.toISOString()
+    });
+  } catch (error) {
+    handleApiError(error, res);
+  }
+});
+
+app.put('/api/product/:id/combinations', async (req, res) => {
+  const { id } = req.params;
+  const { combinations } = req.body;
+
+  try {
+    const responses = await Promise.all(combinations.map(async (combination) => {
+      const { id: combinationId, ...data } = combination;
+      const url = combinationId === 0
+          ? `https://app.ecwid.com/api/v3/${req.storeId}/products/${id}/combinations`
+          : `https://app.ecwid.com/api/v3/${req.storeId}/products/${id}/combinations/${combinationId}`;
+
+      console.log(url);
+      const method = combinationId === 0 ? 'post' : 'put';
+      const response = await axios({
+        method,
+        url,
+        data: combination,
+        headers: { Authorization: `Bearer ${req.apiToken}` }
+      });
+      return response.data;
+    }));
+
+    // console.log(response);
+    res.json(responses);
+  } catch (error) {
+    console.log(error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Update product discounts
+app.put('/api/product/:id/wholesale', async (req, res) => {
+  const { id } = req.params;
+  const { wholesalePrices } = req.body;
+  try {
+    const response = await axios.put(`https://app.ecwid.com/api/v3/${req.storeId}/products/${id}`, { wholesalePrices }, {
+      headers: { Authorization: `Bearer ${req.apiToken}` }
+    });
+    res.json(response.data);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// OAuth token exchange
+app.post('/api/oauth/token/', async (req, res) => {
+  const { code, client_id, client_secret, redirect_uri } = req.body;
+  if (!code) return res.status(400).send('Authorization code is missing.');
+
+  try {
+    const tokenResponse = await axios.post('https://my.ecwid.com/api/oauth/token', null, {
+      params: {
+        client_id,
+        client_secret,
+        code,
+        redirect_uri,
+        grant_type: 'authorization_code',
+      },
+    });
+
+    const { access_token, store_id } = tokenResponse.data;
+
+    await Token.destroy({ where: { store_id } });
+    await Token.create({ store_id, details: JSON.stringify(tokenResponse.data) });
+
+    const details = await StoreDetail.findOne( {where: { store_id: store_id}});
+    if(!details){
+      const futureDate = new Date();
+      futureDate.setDate(futureDate.getDate() + 7);
+
+      await StoreDetail.create({
+        store_id,
+        billing_name:'',
+        billing_email: tokenResponse.data.email,
+        billing_phone: '',
+        billing_address: '-',
+        billing_country: '',
+        billing_date: futureDate,
+        current_package: 1,
+        trial: 1,
+        active: 1,
+      });
+    }
+    res.json(tokenResponse.data);
+  } catch (error) {
+    console.error('Error fetching access token:', error.response ? error.response.data : error.message);
+    res.status(500).send('Failed to fetch access token.');
+  }
+});
+
+// Update product stock
+app.put('/api/products/:id/stock', async (req, res) => {
+  const { id } = req.params;
+  const { stock } = req.body;
+
+  try {
+    const response = await axios.put(
+        `${ECDWID_API_URL}/${req.storeId}/products/${id}`,
+        { quantity: parseInt(stock, 10) },
+        { headers: { Authorization: `Bearer ${req.apiToken}` } }
+    );
+    res.json(response.data);
+  } catch (error) {
+    handleApiError(error, res);
+  }
+});
+
+// Update product
+app.put('/api/products/:id/', async (req, res) => {
+  const { id } = req.params;
+  const { name,description, price,stock, costPrice } = req.body;
+
+  try {
+    const response = await axios.put(
+        `${ECDWID_API_URL}/${req.storeId}/products/${id}`,
+        { quantity: parseInt(stock, 10), name, description, price, costPrice },
+        { headers: { Authorization: `Bearer ${req.apiToken}` } }
+    );
+    res.json(response.data);
+  } catch (error) {
+    handleApiError(error, res);
+  }
+});
+
+// Delete product
+app.delete('/api/products/:id/', async (req, res) => {
+  const { id } = req.params;
+  try {
+    const response = await axios.delete(
+        `${ECDWID_API_URL}/${req.storeId}/products/${id}`,
+        { headers: { Authorization: `Bearer ${req.apiToken}` } }
+    );
+    await Bundle.destroy({ where: { ecwid_id: id } });
+    res.json(response.data);
+  } catch (error) {
+    handleApiError(error, res);
+  }
+});
+
+// Create a bundle
+app.post('/api/bundles', async (req, res) => {
+  const { name, productIds, discount, sku, bundleImages, mainImage, costPrice } = req.body;
+  const prod_ids = productIds.join(',');
+
+
+  try {
+    // console.log(`${ECDWID_API_URL}/${req.storeId}/products?productId=${productIds.map(id => `${id}`).join(',')}`);
+    // Fetch product details from Ecwid
+    const response = await axios.get(
+        `${ECDWID_API_URL}/${req.storeId}/products?productId=${productIds.map(id => `${id}`).join(',')}`,
+        { headers: { Authorization: `Bearer ${req.apiToken}` } }
+    );
+
+    let items = response.data.items;
+
+    // console.log(items);
+
+    // Calculate base price before discounts
+    let basePrice = items.reduce((acc, product) => acc + product.price, 0);
+    const discountValue = discount ? discount / 100 : 0;
+    basePrice -= basePrice * discountValue; // Apply discount
+    basePrice = 0;
+
+    // Create product modifiers for each bundled product
+    const productModifiers = items.map(product => ({
+      name: `Include ${product.name}`, // Checkbox for selection
+      type: "CHECKBOX",
+      choices: [{
+        text: `Add ${product.name}`,
+        priceModifier: product.price, // Adds price when selected
+        priceModifierType: "ABSOLUTE"
+      }]
+    }));
+
+    // Define variations based on product combinations
+    /*const variations = items.map(product => ({
+      combinationNumber: product.id,
+      options: [{ name: product.name, value: product.id }], // Variation name
+      price: product.price, // Price per variation
+      sku: `${sku}-${product.id}`, // Unique SKU per variation
+      quantity: 100, // Default stock (adjust as needed)
+    }));*/
+
+    // Create quantity input fields (Text Fields for entering quantity)
+    /*const quantityFields = items.map(product => ({
+      name: `${product.name} Quantity`,
+      type: "TEXTFIELD",
+      defaultValue: "1" // Default quantity is 1
+    }));*/
+
+    // Merge checkbox options with quantity fields
+    // const productOptions = [...productModifiers, ...quantityFields];
+    const productOptions = [...productModifiers];
+
+    //console.log(productOptions);
+
+    // Save bundle in database
+    const bundle = await Bundle.create({
+      name,
+      product_ids: JSON.stringify(productIds),
+      store_id: req.storeId,
+      discount,
+      sku,
+      price: basePrice,
+      costPrice,
+    });
+
+    // Create product in Ecwid with options
+    const ecwidProduct = await axios.post(
+        `${ECDWID_API_URL}/${req.storeId}/products`,
+        {
+          name,
+          price: basePrice, // Initial price before selection
+          description: "-",
+          enabled: true,
+          sku,
+          costPrice,
+          unlimited: false,
+          quantity: 1,
+          options: productOptions // Includes checkboxes & quantity inputs
+        },
+        { headers: { Authorization: `Bearer ${req.apiToken}` } }
+    );
+    /*const ecwidProduct = await axios.post(
+        `${ECDWID_API_URL}/${req.storeId}/products`,
+        {
+          name,
+          price: basePrice,
+          description: "-",
+          enabled: true,
+          sku,
+          costPrice,
+          unlimited: false,
+          options: [{ name: "Product", type: "SELECT", choices: items.map(p => ({ text: p.name })) }], // Dropdown for variations
+          variations, // Assign variations
+        },
+        { headers: { Authorization: `Bearer ${req.apiToken}` } }
+);*/
+
+    // Update bundle with Ecwid product ID
+    await bundle.update({ ecwid_id: ecwidProduct.data.id });
+
+    // Upload main image (if available)
+    if (mainImage) {
+      try {
+        await axios.post(
+            `${ECDWID_API_URL}/${req.storeId}/products/${ecwidProduct.data.id}/image/async`,
+            { url: mainImage, width: 2500, height: 1500 },
+            { headers: { Authorization: `Bearer ${req.apiToken}` } }
+        );
+      } catch (mainImageError) {
+        console.warn("Main image upload failed:", mainImageError.message);
+      }
+    }
+
+    // Upload gallery images (if available)
+    if (bundleImages.length > 0) {
+      const uploadResults = await Promise.allSettled(
+          bundleImages.map(bundleImage =>
+              axios.post(
+                  `${ECDWID_API_URL}/${req.storeId}/products/${ecwidProduct.data.id}/gallery/async`,
+                  { url: bundleImage, width: 2500, height: 1500 },
+                  { headers: { Authorization: `Bearer ${req.apiToken}` } }
+              )
+          )
+      );
+
+      const failedUploads = uploadResults.filter(result => result.status === "rejected");
+      if (failedUploads.length > 0) {
+        console.warn(`Some gallery images failed to upload:`, failedUploads.length);
+      }
+    }
+
+    res.json(bundle);
+  } catch (error) {
+    handleApiError(error, res);
+  }
+});
+
+// Update a bundle
+app.put('/api/bundles/:id/', async (req, res) => {
+  const { id } = req.params;
+  const { name, productIds, discount, sku, bundleImages, mainImage, costPrice } = req.body;
+
+  if (!productIds || productIds.length === 0) {
+    return res.status(400).json({ error: 'Product IDs cannot be empty' });
+  }
+
+  const prod_ids = productIds.join(',');
+
+  try {
+    const response = await axios.get(`${ECDWID_API_URL}/${req.storeId}/products?productId=${prod_ids}`, {
+      headers: { Authorization: `Bearer ${req.apiToken}` }
+    });
+
+    if (!response.data.items || response.data.items.length !== productIds.length) {
+      return res.status(400).json({ error: 'Some products could not be found' });
+    }
+
+    let price = response.data.items.reduce((acc, product) => acc + product.price, 0);
+    price -= (price * (discount / 100));
+
+    const bundle = await Bundle.findByPk(id);
+    if (bundle) {
+      await bundle.update({ name, product_ids: JSON.stringify(productIds), discount, sku, price, costPrice });
+
+      const ecwidProduct = await axios.put(
+          `${ECDWID_API_URL}/${req.storeId}/products/${bundle.ecwid_id}`,
+          { name, price, description: "Updated bundle", enabled: true, sku, costPrice },
+          { headers: { Authorization: `Bearer ${req.apiToken}` } }
+      );
+
+      try {
+        if(mainImage != '') {
+          await axios.post(
+              `${ECDWID_API_URL}/${req.storeId}/products/${bundle.ecwid_id}/image/async`,
+              {url: `${mainImage}`, width: 2500, height: 1500},
+              {headers: {Authorization: `Bearer ${req.apiToken}`}}
+          );
+        }
+        await Promise.all(
+            bundleImages.map(async (bundleImage, index) => {
+              await axios.post(
+                  `${ECDWID_API_URL}/${req.storeId}/products/${bundle.ecwid_id}/gallery/async`,
+                  { url: `${bundleImage}`, width: 2500, height: 1500 },
+                  { headers: { Authorization: `Bearer ${req.apiToken}` } }
+              );
+            })
+        );
+      } catch (imageError) {
+        console.error("Image download failed:", imageError);
+        return res.status(500).json({ error: 'Some image downloads failed' });
+      }
+
+
+      res.json(bundle);
+    } else {
+      res.status(404).json({ error: 'Bundle not found' });
+    }
+  } catch (error) {
+    handleApiError(error, res);
+  }
+});
+
+// Delete a bundle
+app.delete('/api/bundles/:id/', async (req, res) => {
+  const { id } = req.params;
+
+  try {
+    const bundle = await Bundle.findByPk(id);
+    if (bundle) {
+      await axios.delete(`${ECDWID_API_URL}/${req.storeId}/products/${bundle.ecwid_id}`, {
+        headers: { Authorization: `Bearer ${req.apiToken}` }
+      });
+      await bundle.destroy();
+      res.json({ message: 'Bundle deleted successfully' });
+    } else {
+      res.status(404).json({ error: 'Bundle not found' });
+    }
+  } catch (error) {
+    handleApiError(error, res);
+  }
+});
+
+// Get all bundles
+app.get('/api/bundles', async (req, res) => {
+  try {
+    const bundles = await Bundle.findAll({ where: { store_id: req.storeId } });
+    res.json({ bundles, total: bundles.length });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to fetch bundles' });
+  }
+});
+
+//get all billing
+app.get('/api/billing', async (req, res) => {
+  try {
+    if (!req.storeId) {
+      return res.status(400).json({ error: 'Missing store ID' });
+    }
+
+    const bills = await Bill.findAll({
+      where: { store_id: req.storeId },
+      order: [['bill_id', 'DESC']],
+    });
+
+    res.json({bills:bills});
+  }catch (error) {
+    console.error('Error fetching billing:', error);
+    res.status(500).json({ error: 'Failed to fetch billing' });
+  }
+});
+
+
+app.post('/api/billing/update', async (req, res) => {
+  try {
+    if (!req.storeId) {
+      return res.status(400).json({ error: 'Missing store ID' });
+    }
+
+    const bill = await Bill.findOne({
+      where: { store_id: req.storeId, status: 'Pending' },
+      order: [['bill_id', 'DESC']],
+    });
+
+    if(!bill){
+      const details = await StoreDetail.findOne( {where: { store_id: req.storeId }});
+      let bill = await Bill.create({
+        store_id: req.storeId,
+        url: '-',
+        trans_id: '-',
+        status: 'Pending',
+        tans_data: '',
+        due_date: details.billing_date,
+        amount: 12.00,
+      });
+    }
+
+    res.json({bill:bill});
+  }catch (error) {
+    console.error('Error fetching billing:', error);
+    res.status(500).json({ error: 'Failed to fetch billing' });
+  }
+});
+
+//get bill detail
+app.get('/api/billing/:id', async (req, res) => {
+  const { id } = req.params;
+  try {
+    if (!req.storeId) {
+      return res.status(400).json({ error: 'Missing store ID' });
+    }
+
+    const bill = await Bill.findByPk(id);
+    if (!bill) {
+      return res.status(404).json({ error: 'Bill not found' });
+    }
+
+    res.json({bill});
+  }catch (error) {
+    console.error('Error fetching billing:', error);
+    res.status(500).json({ error: 'Failed to fetch billing' });
+  }
+});
+
+app.post('/api/discount/validate', async (req, res) => {
+  try {
+    const {billId, amount, code} = req.body;
+    // res.json({billId:billId, code:code});
+    // Fetch bill details
+    const bill = await Bill.findByPk(billId);
+    if (!bill) return res.status(404).json({ message: 'Bill not found' });
+
+    if(code == "CHECKDISCOUNT") {
+      await bill.update({amount: 1.0});
+      const discountAmount = amount - 1.00;
+      const finalAmount = 1.00;
+      res.json({
+        valid: true,
+        discountAmount: discountAmount.toFixed(2),
+        finalAmount: finalAmount.toFixed(2),
+        message: 'Discount applied! Amount reduced to $1.00',
+        billId: billId
+      });
+    }else{
+      res.json({
+        valid: false,
+        message: 'Invalid discount code. Please try again',
+        billId: billId
+      });
+    }
+
+
+
+  } catch (error) {
+    res.status(500).json({valid:false, message: error.message});
+  }
+
+});
+
+app.post('/api/billing/:id/pay', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { name, email, paymentMethodId } = req.body.paymentDetails;
+
+    // Fetch bill details
+    const bill = await Bill.findByPk(id);
+    if (!bill) return res.status(404).json({ error: 'Bill not found' });
+
+    // Create a Stripe customer (if not exists)
+    let customer = await stripe.customers.list({ email });
+    if (customer.data.length === 0) {
+      customer = await stripe.customers.create({ name, email });
+    } else {
+      customer = customer.data[0];
+    }
+
+    // Create PaymentIntent
+    const paymentIntent = await stripe.paymentIntents.create({
+      amount: Math.round(bill.amount * 100), // Convert to cents
+      currency: 'usd',
+      customer: customer.id,
+      payment_method: paymentMethodId,
+      confirm: true,
+      automatic_payment_methods: {
+        enabled: true,
+        allow_redirects: 'never' // Ensures only card-based payments
+      }
+    });
+
+    // Update bill status
+    if (paymentIntent.status === 'succeeded') {
+      await bill.update({ status: 'Paid', trans_id: paymentIntent.id, tans_data: JSON.stringify(paymentIntent) });
+      // Add one month to the bill's due_date
+      const currentDueDate = new Date(bill.due_date);
+      const newDueDate = new Date(currentDueDate.setMonth(currentDueDate.getMonth() + 1));
+
+      // Update the store details
+      await StoreDetail.update(
+          { trial: 0, billing_date: newDueDate, active: 1 },
+          { where: { store_id: bill.store_id } }
+      );
+    }
+
+    res.json({ success: true, paymentIntent });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+
+//payment webhook
+app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
+  const sig = req.headers['stripe-signature'];
+  let event;
+
+  try {
+    event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET);
+  } catch (err) {
+    console.error('Webhook signature verification failed.', err.message);
+    return res.status(400).send(`Webhook Error: ${err.message}`);
+  }
+
+  // Handle different event types
+  switch (event.type) {
+    case 'payment_intent.succeeded':
+      const paymentIntent = event.data.object;
+      console.log(`Payment successful: ${paymentIntent.id}`);
+
+      // Update bill as Paid
+     const bill = await Bill.findOne(
+        { where: { trans_id: paymentIntent.id } }
+    );
+      await bill.update(
+          { status: 'Paid', trans_id: paymentIntent.id, tans_data: JSON.stringify(paymentIntent) }
+      );
+
+      // Add one month to the bill's due_date
+      const currentDueDate = new Date(bill.due_date);
+      const newDueDate = new Date(currentDueDate.setMonth(currentDueDate.getMonth() + 1));
+
+      // Update the store details
+      await StoreDetail.update(
+          { trial: 0, billing_date: newDueDate, active: 1 },
+          { where: { store_id: bill.store_id } }
+      );
+      break;
+
+    case 'payment_intent.payment_failed':
+      const failedIntent = event.data.object;
+      console.log(`Payment failed: ${failedIntent.id}`);
+
+      // Update bill as Failed
+      await Bill.update(
+          { status: 'Failed', trans_id: failedIntent.id, tans_data: JSON.stringify(failedIntent) },
+          { where: { trans_id: failedIntent.id } }
+      );
+      break;
+
+    case 'charge.refunded':  // Refund Event
+      const refund = event.data.object;
+      console.log(`Refund issued: ${refund.payment_intent}`);
+
+      // Update bill as Refunded
+      await Bill.update(
+          { status: 'Refunded', tans_data: JSON.stringify(refund) },
+          { where: { trans_id: refund.payment_intent } }
+      );
+      break;
+
+    default:
+      console.log(`Unhandled event type: ${event.type}`);
+  }
+
+  res.json({ received: true });
+});
+
+
+//get store detail
+app.get('/api/store/', async (req, res) => {
+  try {
+    if (!req.storeId) {
+      return res.status(400).json({ error: 'Missing store ID' });
+    }
+
+    const details = await StoreDetail.findOne( {where: { store_id: req.storeId }});
+
+    const store = await axios.get(
+        `${ECDWID_API_URL}/${req.storeId}/profile`,
+        { headers: { Authorization: `Bearer ${req.apiToken}` } }
+    );
+
+    console.log(store.data);
+    res.json({details, store: store.data});
+  }catch (error) {
+    console.error('Error fetching details:', error);
+    res.status(500).json({ error: 'Failed to fetch details' });
+  }
+});
+
+app.put('/api/store/', async (req, res) => {
+  try {
+    const { billing_address, billing_country, billing_email, billing_name, billing_phone, store_id } = req.body;
+    if (!req.storeId) {
+      return res.status(400).json({ error: 'Missing store ID' });
+    }
+
+    const details = await StoreDetail.findOne( {where: { store_id: req.storeId }});
+    if (!details) {
+      res.status(404).json({error: 'No details found'});
+    }else{
+      await StoreDetail.update(
+          { billing_address,
+            billing_email,
+            billing_country,
+            billing_name,
+            billing_phone
+          },
+          { where: { store_id: store_id } }
+      );
+    }
+
+    res.json({details});
+  }catch (error) {
+    console.error('Error fetching details:', error);
+    res.status(500).json({ error: 'Failed to fetch details' });
+  }
+});
+
+//get all notifications
+app.get('/api/notifications', async (req, res) => {
+  try {
+    let { page = 1, limit = 10, sort = 'createdAt', order = 'DESC' } = req.query;
+
+    // Ensure numeric values
+    page = Math.max(1, parseInt(page, 10));
+    limit = Math.max(1, parseInt(limit, 10));
+    const offset = (page - 1) * limit;
+
+    // Validate sorting fields to prevent SQL injection risks
+    const allowedSortFields = ['createdAt', 'updatedAt', 'title']; // Add relevant fields
+    const allowedOrderValues = ['ASC', 'DESC'];
+
+    if (!allowedSortFields.includes(sort)) {
+      return res.status(400).json({ error: 'Invalid sort field' });
+    }
+
+    if (!allowedOrderValues.includes(order.toUpperCase())) {
+      return res.status(400).json({ error: 'Invalid order value' });
+    }
+
+    // Ensure store_id exists
+    if (!req.storeId) {
+      return res.status(400).json({ error: 'Missing store ID' });
+    }
+
+    // Fetch paginated notifications
+    const notifications = await Notification.findAll({
+      where: { store_id: req.storeId },
+      limit,
+      offset,
+      order: [[sort, order.toUpperCase()]],
+    });
+
+    // Count total notifications
+    const totalCount = await Notification.count({
+      where: { store_id: req.storeId },
+    });
+
+    // Count only unread notifications
+    const unreadCount = await Notification.count({
+      where: { store_id: req.storeId, read_flag: 0 },
+    });
+
+    res.json({ notifications, totalCount, unreadCount, page, limit });
+  } catch (error) {
+    console.error('Error fetching notifications:', error);
+    res.status(500).json({ error: 'Failed to fetch notifications' });
+  }
+});
+
+// Update a notification
+app.put('/api/notifications/:id', async (req, res) => {
+  const { id } = req.params;
+  const {read} = req.body;
+
+  try {
+    const notification = await Notification.findByPk(id);
+    if (!notification) {
+      return res.status(404).json({ error: 'Notification not found' });
+    }
+
+    // Update notification fields
+    await notification.update({
+      read_flag: read !== undefined ? read : notification.read_flag
+    });
+
+    res.json({ message: 'Notification updated successfully', notification });
+  } catch (error) {
+    console.error('Error updating notification:', error);
+    res.status(500).json({ error: 'Failed to update notification' });
+  }
+});
+
+// Fetch all options for a store
+app.get('/api/options', async (req, res) => {
+  try {
+    const store_id  = req.storeId; // Get store_id from query params
+    console.log("storeid this is:",req.storeId);
+    if (!store_id) {
+      return res.status(400).json({ error: 'store_id is required' });
+    }
+
+    const options = await Option.findAll({ where: { store_id } });
+    res.status(200).json(options);
+  } catch (error) {
+    console.error('Error fetching options:', error);
+    res.status(500).json({ error: 'Failed to fetch options' });
+  }
+});
+
+// Create a new option
+app.post('/api/options', async (req, res) => {
+  try {
+    const { name, type, values, default_value, required } = req.body;
+    const store_id = req.storeId;
+
+    if (!name || !type || !values) {
+      return res.status(400).json({ error: 'name, type, values, and store_id are required' });
+    }
+
+    const newOption = await Option.create({
+      name,
+      type,
+      values,
+      default_value,
+      required,
+      store_id,
+    });
+    
+    res.status(201).json(newOption);
+  } catch (error) {
+    console.error('Error creating option:', error);
+    res.status(500).json({ error: 'Failed to create option' });
+  }
+});
+
+// Update an existing option
+app.put('/api/options/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { name, type, values, default_value, required } = req.body;
+
+    const option = await Option.findByPk(id);
+    if (!option) {
+      return res.status(404).json({ error: 'Option not found' });
+    }
+
+    option.name = name || option.name;
+    option.type = type || option.type;
+    option.values = values || option.values;
+    option.default_value = default_value || option.default_value;
+    option.required = required || option.required;
+
+    await option.save();
+    res.status(200).json(option);
+  } catch (error) {
+    console.error('Error updating option:', error);
+    res.status(500).json({ error: 'Failed to update option' });
+  }
+});
+
+// Delete an option
+app.delete('/api/options/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const option = await Option.findByPk(id);
+    if (!option) {
+      return res.status(404).json({ error: 'Option not found' });
+    }
+
+    await option.destroy();
+    res.status(204).send(); // No content
+  } catch (error) {
+    console.error('Error deleting option:', error);
+    res.status(500).json({ error: 'Failed to delete option' });
+  }
+});
+
+// Duplicate a product
+app.post('/api/products/:id/duplicate', async (req, res) => {
+  const { id } = req.params;
+  const { newName, newSku, newMainImage, newGalleryImages } = req.body;
+
+  try {
+    // First, fetch the original product
+    const originalProductResponse = await axios.get(
+        `${ECDWID_API_URL}/${req.storeId}/products/${id}`,
+        { headers: { Authorization: `Bearer ${req.apiToken}` } }
+    );
+
+    const originalProduct = originalProductResponse.data;
+
+    // Build the duplicated product data
+    const duplicatedProduct = {
+      name: newName || `${originalProduct.name} (Copy)`,
+      description: originalProduct.description || '',
+      price: originalProduct.price,
+      compareToPrice: originalProduct.compareToPrice,
+      costPrice: originalProduct.costPrice,
+      sku: newSku || `${originalProduct.sku || 'product'}-${Date.now()}`,
+      quantity: originalProduct.quantity,
+      unlimited: originalProduct.unlimited,
+      enabled: originalProduct.enabled,
+      weight: originalProduct.weight,
+      width: originalProduct.width,
+      height: originalProduct.height,
+      depth: originalProduct.depth,
+      taxClassId: originalProduct.taxClassId,
+      categoryIds: originalProduct.categoryIds || [],
+      options: originalProduct.options || [],
+      combinations: originalProduct.combinations || [],
+      attributes: originalProduct.attributes || [],
+      seoTitle: originalProduct.seoTitle,
+      seoDescription: originalProduct.seoDescription,
+    };
+
+    // Remove read-only fields
+    delete duplicatedProduct.id;
+    delete duplicatedProduct.created;
+    delete duplicatedProduct.updated;
+    delete duplicatedProduct.url;
+    delete duplicatedProduct.thumbnailUrl;
+    delete duplicatedProduct.hdThumbnailUrl;
+    delete duplicatedProduct.originalImageUrl;
+    delete duplicatedProduct.productClassId;
+    delete duplicatedProduct.createdTimestamp;
+    delete duplicatedProduct.updatedTimestamp;
+    delete duplicatedProduct.defaultDisplayedPriceFormatted;
+    delete duplicatedProduct.smallThumbnailUrl;
+
+    // Create the new product
+    const newProductResponse = await axios.post(
+        `${ECDWID_API_URL}/${req.storeId}/products`,
+        duplicatedProduct,
+        { headers: { Authorization: `Bearer ${req.apiToken}` } }
+    );
+
+    const newProductId = newProductResponse.data.id;
+
+    // Handle images: Use custom images if provided, otherwise copy from original
+    let mainImageUploaded = false;
+
+    // Handle main image - use custom if provided
+    if (newMainImage && newMainImage.trim()) {
+      try {
+        // Upload custom main image
+        await axios.post(
+            `${ECDWID_API_URL}/${req.storeId}/products/${newProductId}/image/async`,
+            { url: newMainImage, width: 2500, height: 2500 },
+            { headers: { Authorization: `Bearer ${req.apiToken}` } }
+        );
+        mainImageUploaded = true;
+        console.log("Custom main image uploaded successfully");
+      } catch (imageError) {
+        console.warn("Custom main image upload failed:", imageError.message);
+      }
+    }
+
+    // If no custom main image and original has an image, copy it
+    if (!mainImageUploaded && originalProduct.originalImageUrl) {
+      try {
+        await axios.post(
+            `${ECDWID_API_URL}/${req.storeId}/products/${newProductId}/image/async`,
+            { url: originalProduct.originalImageUrl, width: 2500, height: 2500 },
+            { headers: { Authorization: `Bearer ${req.apiToken}` } }
+        );
+        console.log("Original main image copied successfully");
+      } catch (imageError) {
+        console.warn("Main image copy failed:", imageError.message);
+      }
+    }
+
+    // Handle gallery images - use custom if provided
+    if (newGalleryImages && newGalleryImages.length > 0) {
+      console.log(`Uploading ${newGalleryImages.length} custom gallery images`);
+
+      // Upload each custom gallery image
+      for (const galleryUrl of newGalleryImages) {
+        if (galleryUrl && galleryUrl.trim()) {
+          try {
+            await axios.post(
+                `${ECDWID_API_URL}/${req.storeId}/products/${newProductId}/gallery/async`,
+                { url: galleryUrl, width: 2500, height: 2500 },
+                { headers: { Authorization: `Bearer ${req.apiToken}` } }
+            );
+            console.log("Custom gallery image uploaded:", galleryUrl);
+          } catch (error) {
+            console.warn("Failed to upload custom gallery image:", error.message);
+          }
+        }
+      }
+    }
+    // If no custom gallery images and original has gallery images, copy them
+    else if (originalProduct.galleryImages && originalProduct.galleryImages.length > 0) {
+      console.log(`Copying ${originalProduct.galleryImages.length} original gallery images`);
+
+      for (const galleryImage of originalProduct.galleryImages) {
+        if (galleryImage.url) {
+          try {
+            await axios.post(
+                `${ECDWID_API_URL}/${req.storeId}/products/${newProductId}/gallery/async`,
+                { url: galleryImage.url, width: 2500, height: 2500 },
+                { headers: { Authorization: `Bearer ${req.apiToken}` } }
+            );
+            console.log("Original gallery image copied:", galleryImage.url);
+          } catch (error) {
+            console.warn("Failed to copy gallery image:", error.message);
+          }
+        }
+      }
+    }
+
+    // Fetch the newly created product to return complete details
+    const newProduct = await axios.get(
+        `${ECDWID_API_URL}/${req.storeId}/products/${newProductId}`,
+        { headers: { Authorization: `Bearer ${req.apiToken}` } }
+    );
+
+    // Create notification
+    await Notification.create({
+      details: `Product "${originalProduct.name}" was duplicated as "${newProduct.data.name}"`,
+      read_flag: false,
+      store_id: req.storeId,
+    });
+
+    res.json({
+      success: true,
+      message: 'Product duplicated successfully',
+      originalProductId: parseInt(id),
+      newProduct: newProduct.data,
+      editUrl: `/api/products/${newProductId}/edit-json`
+    });
+
+  } catch (error) {
+    console.error('Error duplicating product:', error);
+    handleApiError(error, res);
+  }
+});
+
+// Get product data as JSON for editing
+app.get('/api/products/:id/edit-json', async (req, res) => {
+  const { id } = req.params;
+
+  try {
+    // Fetch the product from Ecwid
+    const productResponse = await axios.get(
+        `${ECDWID_API_URL}/${req.storeId}/products/${id}`,
+        { headers: { Authorization: `Bearer ${req.apiToken}` } }
+    );
+
+    const product = productResponse.data;
+
+    // Create a clean, editable JSON structure
+    const editableProduct = {
+      // Basic Information
+      id: product.id,
+      name: product.name,
+      description: product.description || '',
+      price: product.price,
+      compareToPrice: product.compareToPrice || null,
+      costPrice: product.costPrice || null,
+      sku: product.sku || '',
+
+      // Inventory
+      quantity: product.quantity || 0,
+      unlimited: product.unlimited || false,
+      inStock: product.inStock || true,
+
+      // Visibility
+      enabled: product.enabled || true,
+
+      // Shipping
+      weight: product.weight || 0,
+      width: product.width || 0,
+      height: product.height || 0,
+      depth: product.depth || 0,
+      freeShipping: product.freeShipping || false,
+      shippingOnlyRecalculate: product.shippingOnlyRecalculate || false,
+
+      // Tax
+      taxClassId: product.taxClassId || 0,
+
+      // Categories
+      categoryIds: product.categoryIds || [],
+
+      // Images
+      originalImageUrl: product.originalImageUrl || null,
+      thumbnailUrl: product.thumbnailUrl || null,
+      galleryImages: product.galleryImages || [],
+
+      // Options (for product customization)
+      options: (product.options || []).map(option => ({
+        id: option.id,
+        name: option.name,
+        type: option.type,
+        required: option.required || false,
+        choices: option.choices || [],
+        defaultValue: option.defaultValue || null
+      })),
+
+      // Variations/Combinations
+      combinations: (product.combinations || []).map(combination => ({
+        id: combination.id,
+        options: combination.options || [],
+        sku: combination.sku || '',
+        price: combination.price || 0,
+        quantity: combination.quantity || 0,
+        unlimited: combination.unlimited || false
+      })),
+
+      // Attributes (additional product properties)
+      attributes: product.attributes || [],
+
+      // SEO Metadata
+      seoTitle: product.seoTitle || '',
+      seoDescription: product.seoDescription || '',
+
+      // URLs
+      pageUrl: product.pageUrl || '',
+      productUrl: product.productUrl || '',
+
+      // Additional Info
+      defaultCombinationId: product.defaultCombinationId || 0,
+      defaultCategoryId: product.defaultCategoryId || null,
+      brand: product.brand || null,
+
+      // Metadata for editing
+      _meta: {
+        lastUpdated: product.updated,
+        created: product.created,
+        productType: product.productType || 'physical',
+        editable: true,
+        apiEndpoint: `/api/products/${id}`,
+        availableMethods: ['PUT', 'DELETE']
+      }
+    };
+
+    res.json({
+      success: true,
+      product: editableProduct,
+      rawProduct: product // Include raw product data if needed
+    });
+
+  } catch (error) {
+    console.error('Error fetching product for editing:', error);
+    handleApiError(error, res);
+  }
+});
+
+
+// Webhook endpoint
+app.post('/api/webhook', async (req, res) => {
+  console.log('Webhook received:', req.body);
+
+  const eventData = req.body;
+
+  if (eventData.eventType === 'product.updated') {
+    const tokenRecord = await Token.findOne({where: {store_id: eventData.storeId}});
+
+    if (!tokenRecord) {
+      console.error(`No token found for storeId: ${eventData.storeId}`);
+      return res.status(404).json({error: 'Token not found'});
+    }
+
+    // Parse JSON details column
+    const tokenDetails = JSON.parse(JSON.parse(tokenRecord.details));
+
+    const bundles = await Bundle.findAll({where: Sequelize.literal(`JSON_CONTAINS(product_ids, '${eventData.entityId}')`)});
+
+    if (bundles) {
+      let product_detail = await axios.get(
+          `${ECDWID_API_URL}/${eventData.storeId}/products/${eventData.entityId}`,
+          {headers: {Authorization: `Bearer ${tokenDetails.access_token}`}}
+      );
+      if (!product_detail.data.unlimited) {
+        let stock = product_detail.data.quantity;
+
+        bundles.map(async (bundle, index) => {
+          let response = await axios.put(
+              `${ECDWID_API_URL}/${eventData.storeId}/products/${bundle.ecwid_id}`,
+              {quantity: parseInt(stock, 10)},
+              {headers: {Authorization: `Bearer ${tokenDetails.access_token}`}}
+          );
+
+          if (stock < 2) {
+            if (stock == 1)
+              notification_text = `Stock status of ${bundle.name} has reduced to 1`;
+            else if (stock == 0)
+              notification_text = `${bundle.name} is out of stock`;
+
+            let notification = await Notification.create({
+              details: notification_text,
+              read_flag: false,
+              store_id: eventData.storeId,
+            });
+          }
+
+        });
+      }
+    }else {
+      let product_detail = await axios.get(
+          `${ECDWID_API_URL}/${eventData.storeId}/products/${eventData.entityId}`,
+          {headers: {Authorization: `Bearer ${tokenDetails.access_token}`}}
+      );
+      if (!product_detail.data.unlimited) {
+        let stock = product_detail.data.quantity;
+        if (stock < 2) {
+          if (stock == 1)
+            notification_text = `Stock status of ${product_detail.name} has reduced to 1`;
+          else if (stock == 0)
+            notification_text = `${product_detail.name} is out of stock`;
+
+          let notification = await Notification.create({
+            details: notification_text,
+            read_flag: false,
+            store_id: eventData.storeId,
+          });
+        }
+      }
+    }
+  }
+
+  if (eventData.eventType === 'order.updated') {
+    const {orderId, oldPaymentStatus, newPaymentStatus, oldFulfillmentStatus, newFulfillmentStatus} = eventData.data;
+
+    console.log(`Order ID: ${orderId}`);
+    console.log(`Old Payment Status: ${oldPaymentStatus}`);
+    console.log(`New Payment Status: ${newPaymentStatus}`);
+    console.log(`Old Fulfillment Status: ${oldFulfillmentStatus}`);
+    console.log(`New Fulfillment Status: ${newFulfillmentStatus}`);
+    if (oldPaymentStatus == 'AWAITING_PAYMENT' && newPaymentStatus == 'PAID') {
+      try {
+        // Fetch the single token record
+        const tokenRecord = await Token.findOne({where: {store_id: eventData.storeId}});
+
+        if (!tokenRecord) {
+          console.error(`No token found for storeId: ${eventData.storeId}`);
+          return res.status(404).json({error: 'Token not found'});
+        }
+
+        // Parse JSON details column
+        const tokenDetails = JSON.parse(JSON.parse(tokenRecord.details));
+
+        const orderDetails = await axios.get(`${ECDWID_API_URL}/${eventData.storeId}/orders/${orderId}`, {
+          headers: {Authorization: `Bearer ${tokenDetails.access_token}`}
+        });
+        // console.log(orderDetails.data);
+        orderDetails.data.items.map(async (orderItem, index) => {
+          let bundle = await Bundle.findOne({where: {ecwid_id: orderItem.productId}});
+          if(bundle){
+            let product_ids = JSON.parse(bundle.product_ids);
+            product_ids.map(async (product, index) => {
+              let product_detail = await axios.get(
+                  `${ECDWID_API_URL}/${eventData.storeId}/products/${product}`,
+                  { headers: { Authorization: `Bearer ${tokenDetails.access_token}` } }
+              );
+              if(!product_detail.data.unlimited) {
+                let stock = product_detail.data.quantity - orderItem.quantity;
+
+                const response = await axios.put(
+                    `${ECDWID_API_URL}/${eventData.storeId}/products/${product}`,
+                    {quantity: parseInt(stock, 10)},
+                    {headers: {Authorization: `Bearer ${tokenDetails.access_token}`}}
+                );
+              }
+            });
+          }else {
+
+            let bundles = await Bundle.findAll({where: Sequelize.literal(`JSON_CONTAINS(product_ids, '${orderItem.productId}')`)});
+            if (bundles) {
+              let product_detail = await axios.get(
+                  `${ECDWID_API_URL}/${eventData.storeId}/products/${orderItem.productId}`,
+                  {headers: {Authorization: `Bearer ${tokenDetails.access_token}`}}
+              );
+              if (!product_detail.data.unlimited) {
+                let stock = product_detail.data.quantity;
+
+                bundles.map(async (bundle, index) => {
+                  let response = await axios.put(
+                      `${ECDWID_API_URL}/${eventData.storeId}/products/${bundle.ecwid_id}`,
+                      {quantity: parseInt(stock, 10)},
+                      {headers: {Authorization: `Bearer ${tokenDetails.access_token}`}}
+                  );
+                });
+              }
+            }
+          }
+
+        });
+        console.log(orderDetails.data.items);
+
+        let notification = await Notification.create({
+          details: `Order #${orderId}  has been paid`,
+          read_flag: false,
+          store_id: eventData.storeId,
+        });
+
+        // Respond with success
+        res.status(200).send('Webhook processed successfully');
+      } catch (error) {
+        console.error('Error processing webhook:', error);
+        res.status(500).json({error: 'Internal server error'});
+      }
+    } else {
+      res.status(400).json({error: 'Unsupported event type'});
+    }
+  }else{
+    res.status(200).send('Webhook skipped...');
+  }
+});
+
+routes.configure(app);
+
+// Error handling function for API calls
+function handleApiError(error, res) {
+  if (error.response) {
+    res.status(error.response.status).json(error.response.data);
+  } else if (error.request) {
+    res.status(500).json({ error: 'No response received from Ecwid' });
+  } else {
+    res.status(500).json({ error: error.message });
+  }
+}
+
+// Create HTTPS server
+const httpsServer = https.createServer(sslOptions, app);
+httpsServer.listen(HTTPS_PORT || 3339, () => {
+  console.log(`HTTPS Server running on port ${HTTPS_PORT || 3339}`);
+});
+
+// Start HTTP server
+app.listen(PORT || 3338, () => {
+  console.log(`HTTP Server running on port ${PORT || 3338}`);
+});

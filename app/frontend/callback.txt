@@ -1,0 +1,28 @@
+
+{"eventId":"6cf7193a-1354-4c10-8c5f-bc658c557a53","eventCreated":1739355041,"storeId":112146506,"entityId":543143361,"eventType":"unfinished_order.created","data":{"orderId":"SAG3O","cartId":"C0F20FB6-7ECC-49A9-AA18-83C81C9EA298"}}
+{"eventId":"8e68b93c-f753-4fed-bf97-14e5c8999d11","eventCreated":1739355043,"storeId":112146506,"entityId":290873034,"eventType":"customer.updated","data":{"customerEmail":"irfanbaree@gmail.com"}}
+{"eventId":"e4416b86-336d-4c77-8866-f29ecde73a90","eventCreated":1739355043,"storeId":112146506,"entityId":543143361,"eventType":"order.created","data":{"newPaymentStatus":"AWAITING_PAYMENT","newFulfillmentStatus":"AWAITING_PROCESSING","orderId":"SAG3O"}}
+{"eventId":"edaa22a5-1017-4a28-808d-fb81e2111edb","eventCreated":1739355043,"storeId":112146506,"entityId":543143859,"eventType":"unfinished_order.created","data":{"orderId":"VWCIP","cartId":"C0F20FB6-7ECC-49A9-AA18-83C81C9EA298"}}
+{"eventId":"017068c9-2b7c-4cff-b14e-bf3a834f44fc","eventCreated":1739355070,"storeId":112146506,"entityId":543143361,"eventType":"order.updated","data":{"oldPaymentStatus":"AWAITING_PAYMENT","newPaymentStatus":"AWAITING_PAYMENT","oldFulfillmentStatus":"AWAITING_PROCESSING","newFulfillmentStatus":"AWAITING_PROCESSING","orderId":"SAG3O"}}
+{"eventId":"f760e226-80cf-4c17-8ab9-07eabf001996","eventCreated":1739355226,"storeId":112146506,"entityId":543143361,"eventType":"order.updated","data":{"oldPaymentStatus":"AWAITING_PAYMENT","newPaymentStatus":"PAID","oldFulfillmentStatus":"AWAITING_PROCESSING","newFulfillmentStatus":"PROCESSING","orderId":"SAG3O"}}
+{"eventId":"96f089d0-c703-4ee0-a1fa-f4117eb28dec","eventCreated":1739357990,"storeId":111252503,"entityId":543144587,"eventType":"order.updated","data":{"oldPaymentStatus":"AWAITING_PAYMENT","newPaymentStatus":"AWAITING_PAYMENT","oldFulfillmentStatus":"AWAITING_PROCESSING","newFulfillmentStatus":"AWAITING_PROCESSING","orderId":"TTONV"}}
+
+{
+  "eventId": "95ed494f-362d-4fca-933d-f5c7064b04bb",
+  "eventCreated": 1634209655,
+  "storeId": 1003,
+  "entityId": 293225803, 
+  "eventType": "unfinished_order.created",
+  "data": {
+    "orderId": "RA1SD",
+    "cartId": "320AB5DE-5EA6-4419-A4CF-0B04D2913190"
+  }
+}
+{"eventId":"b765cc94-16b9-40b7-99a9-f8e5ae7dcd2e","eventCreated":1739357996,"storeId":111252503,"entityId":543144587,"eventType":"order.updated","data":{"oldPaymentStatus":"AWAITING_PAYMENT","newPaymentStatus":"AWAITING_PAYMENT","oldFulfillmentStatus":"AWAITING_PROCESSING","newFulfillmentStatus":"AWAITING_PROCESSING","orderId":"TTONV"}}
+{"eventId":"b4013606-8c94-4b75-8fea-72e3eecf7230","eventCreated":1739358001,"storeId":111252503,"entityId":543144587,"eventType":"order.updated","data":{"oldPaymentStatus":"AWAITING_PAYMENT","newPaymentStatus":"PAID","oldFulfillmentStatus":"AWAITING_PROCESSING","newFulfillmentStatus":"DELIVERED","orderId":"TTONV"}}
+{"eventId":"6731b554-821d-4516-8869-47eef07090ae","eventCreated":1739358018,"storeId":111252503,"entityId":543144590,"eventType":"unfinished_order.created","data":{"orderId":"MF523","cartId":"DC0C82F2-3F53-4073-AEF1-D8691CFE8AA8"}}
+{"eventId":"c2cbd662-a0ff-4514-9ea1-78158f87e882","eventCreated":1739358022,"storeId":111252503,"entityId":543144590,"eventType":"unfinished_order.updated","data":{"orderId":"MF523","cartId":"DC0C82F2-3F53-4073-AEF1-D8691CFE8AA8"}}
+{"eventId":"c19deae2-9954-43d6-a80d-015060d163d3","eventCreated":1739358023,"storeId":111252503,"entityId":543144590,"eventType":"order.created","data":{"newPaymentStatus":"AWAITING_PAYMENT","newFulfillmentStatus":"AWAITING_PROCESSING","orderId":"MF523"}}
+{"eventId":"c0d399aa-f65b-4897-b456-b211405dfc3f","eventCreated":1739358023,"storeId":111252503,"entityId":543144591,"eventType":"unfinished_order.created","data":{"orderId":"VC4GB","cartId":"DC0C82F2-3F53-4073-AEF1-D8691CFE8AA8"}}
+{"eventId":"f601b19f-b484-48bd-971e-c80c305f05db","eventCreated":1739358023,"storeId":111252503,"entityId":290737504,"eventType":"customer.updated","data":{"customerEmail":"vohoye2436@owlny.com"}}
+{"eventId":"f905b5f2-cfcc-4178-bb71-9bca3193925b","eventCreated":1739358058,"storeId":111252503,"entityId":543144590,"eventType":"order.updated","data":{"oldPaymentStatus":"AWAITING_PAYMENT","newPaymentStatus":"AWAITING_PAYMENT","oldFulfillmentStatus":"AWAITING_PROCESSING","newFulfillmentStatus":"AWAITING_PROCESSING","orderId":"MF523"}}

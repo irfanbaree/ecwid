@@ -1,0 +1,147 @@
+require('dotenv').config();
+const express = require('express');
+const axios = require('axios');
+const bodyParser = require('body-parser');
+const cors = require('cors');
+const { Sequelize, DataTypes } = require('sequelize');
+const https = require('https');
+const fs = require('fs');
+
+const {
+    DB_HOST,
+    DB_USER,
+    DB_PASSWORD,
+    DB_NAME,
+    DB_PORT,
+} = process.env;
+
+
+// Sequelize setup
+const sequelize = new Sequelize(DB_NAME, DB_USER, DB_PASSWORD, {
+    host: DB_HOST,
+    dialect: 'mysql',
+    port: DB_PORT || 3306,
+});
+
+const Notification = sequelize.define('notification', {
+    details: { type: DataTypes.STRING, allowNull: false },
+    store_id: { type: DataTypes.STRING, allowNull: false },
+    read_flag: { type: DataTypes.BOOLEAN, allowNull: false },
+}, { timestamps: true });
+
+
+const Bill = sequelize.define('bills', {
+    bill_id: { type: DataTypes.INTEGER, autoIncrement: true, primaryKey: true },
+    store_id: { type: DataTypes.INTEGER, allowNull: false },
+    url: { type: DataTypes.STRING(2000), allowNull: false },
+    trans_id: { type: DataTypes.STRING(100), allowNull: false },
+    status: { type: DataTypes.ENUM('Pending', 'Paid', 'Failed'), allowNull: false, defaultValue: 'Pending' },
+    tans_data: { type: DataTypes.TEXT },
+    due_date: { type: DataTypes.DATEONLY, allowNull: false },
+    amount: { type: DataTypes.FLOAT, allowNull: false },
+    created_at: { type: DataTypes.DATE, allowNull: false, defaultValue: Sequelize.NOW },
+    updated_at: { type: DataTypes.DATE, allowNull: false, defaultValue: Sequelize.NOW }
+}, { timestamps: false });
+
+const StoreDetail = sequelize.define('storedetails', {
+    det_id: { type: DataTypes.INTEGER, autoIncrement: true, primaryKey: true },
+    store_id: { type: DataTypes.INTEGER, allowNull: false },
+    billing_name: { type: DataTypes.STRING(100), allowNull: false },
+    billing_email: { type: DataTypes.STRING(255), allowNull: false },
+    billing_phone: { type: DataTypes.STRING(40), allowNull: false },
+    billing_address: { type: DataTypes.STRING(500), allowNull: false },
+    billing_country: { type: DataTypes.STRING(100), allowNull: false },
+    billing_date: { type: DataTypes.DATEONLY, allowNull: false },
+    current_package: { type: DataTypes.INTEGER, allowNull: false },
+    trial: { type: DataTypes.BOOLEAN, allowNull: false, defaultValue: 0 },
+    active: { type: DataTypes.BOOLEAN, allowNull: false, defaultValue: 1 },
+    created_at: { type: DataTypes.DATE, allowNull: false, defaultValue: Sequelize.NOW },
+    updated_at: { type: DataTypes.DATE, allowNull: false, defaultValue: Sequelize.NOW }
+}, { timestamps: false });
+
+
+sequelize.sync(); // Synchronize models with the database
+
+
+async function checkBilling() {
+    try {
+        const today = new Date();
+        today.setDate(today.getDate() + 5); // 5 days ahead
+        const billingDate = today.toISOString().split('T')[0]; // Format as YYYY-MM-DD
+
+        console.log(`Checking stores with billing date: ${billingDate}`);
+
+        // Fetch stores whose billing date is 5 days from today
+        const stores = await StoreDetail.findAll({ where: { billing_date: billingDate } });
+
+        if (stores.length === 0) {
+            console.log("No stores found for billing.");
+            return;
+        }
+
+        console.log(`Found ${stores.length} stores for billing.`);
+
+        for (const store of stores) {
+            const bill = await Bill.create({
+                store_id: store.store_id,
+                url: '-',
+                trans_id: '-',
+                status: 'Pending',
+                tans_data: '',
+                due_date: billingDate,
+                amount: 14.99, // Replace with actual logic to fetch amount
+                created_at: new Date(),
+                updated_at: new Date(),
+            });
+
+            console.log(`Bill created for store ${store.store_id}:`, bill.bill_id);
+        }
+    } catch (error) {
+        console.error("Error checking billing:", error);
+    }
+}
+
+async function checkStatus() {
+    try {
+        const today = new Date();
+        const billingDate = today.toISOString().split('T')[0]; // Format as YYYY-MM-DD
+
+        console.log(`Checking bills with due date before: ${billingDate}`);
+
+        // Fetch bills where due_date < billingDate and status = 'Pending'
+        const overdueBills = await Bill.findAll({
+            where: {
+                due_date: { [Sequelize.Op.lt]: billingDate },
+                status: 'Pending'
+            }
+        });
+
+        if (overdueBills.length === 0) {
+            console.log("No overdue pending bills found.");
+            return;
+        }
+
+        console.log(`Found ${overdueBills.length} overdue pending bills.`);
+
+        const updatedStoreIds = new Set();
+
+        for (const bill of overdueBills) {
+            // Update store's active status to false if not already done
+            if (!updatedStoreIds.has(bill.store_id)) {
+                await StoreDetail.update(
+                    { active: false },
+                    { where: { store_id: bill.store_id } }
+                );
+                updatedStoreIds.add(bill.store_id);
+                console.log(`Store ${bill.store_id} set to inactive.`);
+            }
+        }
+    } catch (error) {
+        console.error("Error checking status:", error);
+    }
+}
+
+
+// Run the function once
+checkBilling();
+checkStatus();

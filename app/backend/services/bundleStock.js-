@@ -1,0 +1,175 @@
+const EFFECTIVELY_UNLIMITED_STOCK = 999999;
+
+// Normalizes a parsed product_ids array so both the old shape (plain numeric
+// ids, qty implicitly 1) and the new shape ({ productId, qty }) work the same.
+function normalizeChildren(productIds) {
+  return (productIds || []).map((entry) => {
+    if (entry && typeof entry === 'object') {
+      return { productId: entry.productId, qty: Math.max(1, parseInt(entry.qty, 10) || 1) };
+    }
+    return { productId: entry, qty: 1 };
+  });
+}
+
+function parseChildren(bundle) {
+  let parsed = [];
+  try {
+    parsed = JSON.parse(bundle.product_ids) || [];
+  } catch {
+    parsed = [];
+  }
+  return normalizeChildren(parsed);
+}
+
+// Bundle stock = min(floor(childStock / qty)) across non-unlimited children.
+// If every child is unlimited (or there are no constraining children), the
+// bundle is treated as effectively unlimited.
+function computeStock(children, productLookup) {
+  let allUnlimited = true;
+  const constrained = [];
+
+  for (const child of children) {
+    const info = productLookup(child.productId);
+    if (!info) continue; // child product missing/unreachable - don't let it block the calc
+    if (info.unlimited) continue;
+    allUnlimited = false;
+    constrained.push(Math.floor(info.quantity / child.qty));
+  }
+
+  if (allUnlimited || constrained.length === 0) return EFFECTIVELY_UNLIMITED_STOCK;
+  return Math.min(...constrained);
+}
+
+// Mirrors each child product's own Ecwid Options (e.g. Size, Color) onto the
+// bundle product, prefixed with the child's name so multiple children with a
+// same-named option (e.g. two products both having "Size") stay disambiguated.
+// Choices are carried over with priceModifier forced to 0 - bundle price is
+// already fixed by the bundle's own discount calculation, picking a variant
+// shouldn't change it. Options are marked required since that child is always
+// part of the bundle.
+function buildMirroredOptions(children, productsById) {
+  const options = [];
+  children.forEach((child) => {
+    const product = productsById[child.productId];
+    if (!product || !Array.isArray(product.options)) return;
+    product.options.forEach((option) => {
+      if (!Array.isArray(option.choices) || option.choices.length === 0) return;
+      options.push({
+        name: `${product.name} – ${option.name}`,
+        nameTranslated: { en: `${product.name} – ${option.name}` },
+        type: option.type || 'SELECT',
+        required: true,
+        choices: option.choices.map((choice) => ({
+          text: choice.text,
+          textTranslated: choice.textTranslated || { en: choice.text },
+          priceModifier: 0,
+          priceModifierType: 'ABSOLUTE',
+        })),
+      });
+    });
+  });
+  return options;
+}
+
+function createBundleStockService({ Bundle, Token, Notification, axios, ECDWID_API_URL }) {
+  async function resolveAccessToken(storeId) {
+    const tokenRecord = await Token.findOne({ where: { store_id: storeId } });
+    if (!tokenRecord) return null;
+
+    let details = tokenRecord.details;
+    // `details` has historically been stored double-JSON-encoded; unwrap defensively.
+    for (let i = 0; i < 2 && typeof details === 'string'; i++) {
+      try {
+        details = JSON.parse(details);
+      } catch {
+        break;
+      }
+    }
+    return details && details.access_token ? details.access_token : null;
+  }
+
+  async function getEcwidProduct(storeId, productId, accessToken) {
+    const response = await axios.get(
+      `${ECDWID_API_URL}/${storeId}/products/${productId}`,
+      { headers: { Authorization: `Bearer ${accessToken}` } }
+    );
+    return response.data;
+  }
+
+  async function pushBundleStock(storeId, bundle, stock, accessToken) {
+    const unlimited = stock >= EFFECTIVELY_UNLIMITED_STOCK;
+    await axios.put(
+      `${ECDWID_API_URL}/${storeId}/products/${bundle.ecwid_id}`,
+      { quantity: unlimited ? 0 : stock, unlimited },
+      { headers: { Authorization: `Bearer ${accessToken}` } }
+    );
+    await bundle.update({ stock });
+  }
+
+  async function notifyLowStock(storeId, label, stock) {
+    if (stock > 1) return;
+    const details = stock === 0 ? `${label} is out of stock` : `Stock status of ${label} has reduced to 1`;
+    await Notification.create({ details, read_flag: false, store_id: storeId });
+  }
+
+  async function syncBundleStock(storeId, bundle, accessToken) {
+    const children = parseChildren(bundle);
+    if (children.length === 0) return bundle.stock;
+
+    const productInfos = await Promise.all(
+      children.map((child) => getEcwidProduct(storeId, child.productId, accessToken).catch(() => null))
+    );
+
+    const lookup = {};
+    children.forEach((child, i) => {
+      const info = productInfos[i];
+      if (info) lookup[child.productId] = { quantity: info.quantity, unlimited: info.unlimited };
+    });
+
+    const stock = computeStock(children, (id) => lookup[id]);
+    await pushBundleStock(storeId, bundle, stock, accessToken);
+    await notifyLowStock(storeId, bundle.name, stock);
+    return stock;
+  }
+
+  async function decrementChildrenForSale(storeId, bundle, soldQty, accessToken) {
+    const children = parseChildren(bundle);
+    await Promise.all(
+      children.map(async (child) => {
+        const info = await getEcwidProduct(storeId, child.productId, accessToken).catch(() => null);
+        if (!info || info.unlimited) return;
+        const newQuantity = Math.max(0, info.quantity - child.qty * soldQty);
+        await axios.put(
+          `${ECDWID_API_URL}/${storeId}/products/${child.productId}`,
+          { quantity: newQuantity },
+          { headers: { Authorization: `Bearer ${accessToken}` } }
+        );
+      })
+    );
+  }
+
+  async function findBundlesContainingProduct(storeId, productId) {
+    const bundles = await Bundle.findAll({ where: { store_id: storeId } });
+    return bundles.filter((bundle) =>
+      parseChildren(bundle).some((child) => String(child.productId) === String(productId))
+    );
+  }
+
+  return {
+    resolveAccessToken,
+    getEcwidProduct,
+    pushBundleStock,
+    syncBundleStock,
+    decrementChildrenForSale,
+    findBundlesContainingProduct,
+  };
+}
+
+module.exports = {
+  EFFECTIVELY_UNLIMITED_STOCK,
+  normalizeChildren,
+  parseChildren,
+  computeStock,
+  buildMirroredOptions,
+  createBundleStockService,
+};

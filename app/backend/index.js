@@ -1,0 +1,2608 @@
+require('dotenv').config();
+const express = require('express');
+// const axios = require('axios');
+const axios = require('./httpClient');
+const bodyParser = require('body-parser');
+const cors = require('cors');
+const { Sequelize, DataTypes, Op } = require('sequelize');
+const bcrypt = require('bcrypt');
+const jwt = require('jsonwebtoken');
+const https = require('https');
+const fs = require('fs');
+
+const path = require('path');
+const { pipeline } = require('stream');
+const Busboy = require('busboy');
+const routes = require("./routes");
+
+const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
+
+const app = express();
+app.use(bodyParser.json());
+app.use(cors());
+const {
+  DB_HOST,
+  DB_USER,
+  DB_PASSWORD,
+  DB_NAME,
+  DB_PORT,
+  ECDWID_API_URL,
+  SSL_KEY_PATH,
+  SSL_CERT_PATH,
+  PORT,
+  HTTPS_PORT
+} = process.env;
+
+// SSL configuration
+const sslOptions = {
+  key: fs.readFileSync(SSL_KEY_PATH),
+  cert: fs.readFileSync(SSL_CERT_PATH)
+};
+
+// Sequelize setup
+const sequelize = new Sequelize(DB_NAME, DB_USER, DB_PASSWORD, {
+  host: DB_HOST,
+  dialect: 'mysql',
+  port: DB_PORT || 3306,
+});
+
+const Token = sequelize.define('Token', {
+  store_id: {
+    type: DataTypes.STRING,
+    allowNull: false,
+    primaryKey: true
+  },
+  details: {
+    type: DataTypes.JSON,
+    allowNull: false
+  }
+}, { timestamps: false });
+
+const Bundle = sequelize.define('Bundle', {
+  name: { type: DataTypes.STRING, allowNull: false },
+  // Holds [{ productId, qty }] as JSON text. NOTE: this column was originally
+  // a VARCHAR(255) (DataTypes.STRING) storing a plain array of ids; switching
+  // to TEXT requires a one-time manual migration on existing databases:
+  //   ALTER TABLE Bundles MODIFY COLUMN product_ids TEXT;
+  // (sequelize.sync() does not alter existing columns). See also
+  // scripts/migrate-bundle-qty.js for migrating the row data itself.
+  product_ids: { type: DataTypes.TEXT, allowNull: false },
+  store_id: { type: DataTypes.STRING, allowNull: false },
+  discount: { type: DataTypes.FLOAT, allowNull: false },
+  sku: { type: DataTypes.STRING, allowNull: false },
+  quantity: { type: DataTypes.INTEGER, defaultValue: 1 },
+  price: { type: DataTypes.FLOAT, allowNull: false },
+  costPrice: { type: DataTypes.FLOAT, allowNull: false },
+  ecwid_id: { type: DataTypes.INTEGER, allowNull: true },
+  // Cached, last-computed bundle stock (see services/bundleStock.js). Kept
+  // fresh by the create/update routes, the webhook handlers, and the cron
+  // reconciliation pass - read directly by GET /api/bundles instead of being
+  // recomputed on every request.
+  stock: { type: DataTypes.INTEGER, allowNull: false, defaultValue: 0 },
+  bundle_type: { type: DataTypes.ENUM('fixed', 'flexible'), defaultValue: 'flexible' }
+}, { timestamps: false });
+
+const Notification = sequelize.define('notification', {
+  details: { type: DataTypes.STRING, allowNull: false },
+  store_id: { type: DataTypes.STRING, allowNull: false },
+  read_flag: { type: DataTypes.BOOLEAN, allowNull: false },
+}, { timestamps: true });
+
+
+const Bill = sequelize.define('bills', {
+  bill_id: { type: DataTypes.INTEGER, autoIncrement: true, primaryKey: true },
+  store_id: { type: DataTypes.INTEGER, allowNull: false },
+  url: { type: DataTypes.STRING(2000), allowNull: false },
+  trans_id: { type: DataTypes.STRING(100), allowNull: false },
+  status: { type: DataTypes.ENUM('Pending', 'Paid', 'Failed'), allowNull: false, defaultValue: 'Pending' },
+  tans_data: { type: DataTypes.TEXT },
+  due_date: { type: DataTypes.DATEONLY, allowNull: false },
+  amount: { type: DataTypes.FLOAT, allowNull: false },
+  created_at: { type: DataTypes.DATE, allowNull: false, defaultValue: Sequelize.NOW },
+  updated_at: { type: DataTypes.DATE, allowNull: false, defaultValue: Sequelize.NOW }
+}, { timestamps: false });
+
+const StoreDetail = sequelize.define('storedetails', {
+  det_id: { type: DataTypes.INTEGER, autoIncrement: true, primaryKey: true },
+  store_id: { type: DataTypes.INTEGER, allowNull: false },
+  billing_name: { type: DataTypes.STRING(100), allowNull: false },
+  billing_email: { type: DataTypes.STRING(255), allowNull: false },
+  billing_phone: { type: DataTypes.STRING(40), allowNull: false },
+  billing_address: { type: DataTypes.STRING(500), allowNull: false },
+  billing_country: { type: DataTypes.STRING(100), allowNull: false },
+  billing_date: { type: DataTypes.DATEONLY, allowNull: false },
+  current_package: { type: DataTypes.INTEGER, allowNull: false },
+  trial: { type: DataTypes.BOOLEAN, allowNull: false, defaultValue: 0 },
+  active: { type: DataTypes.BOOLEAN, allowNull: false, defaultValue: 1 },
+  created_at: { type: DataTypes.DATE, allowNull: false, defaultValue: Sequelize.NOW },
+  updated_at: { type: DataTypes.DATE, allowNull: false, defaultValue: Sequelize.NOW }
+}, { timestamps: false });
+
+const Package = sequelize.define('packages', {
+  package_id: { type: DataTypes.INTEGER, autoIncrement: true, primaryKey: true },
+  package: { type: DataTypes.STRING(300), allowNull: false },
+  details: { type: DataTypes.STRING(500), allowNull: false },
+  price: { type: DataTypes.DECIMAL(10,0), allowNull: false },
+  trial_days: { type: DataTypes.INTEGER, allowNull: false }
+}, { timestamps: false });
+
+const Option = sequelize.define('Option', {
+  id: {
+    type: DataTypes.INTEGER,
+    primaryKey: true,
+    autoIncrement: true,
+  },
+  name: {
+    type: DataTypes.STRING,
+    allowNull: false,
+  },
+  type: {
+    type: DataTypes.STRING,
+    allowNull: false,
+  },
+  values: {
+    type: DataTypes.JSON, // Store values as a JSON array
+    allowNull: false,
+  },
+  default_value: {
+    type: DataTypes.STRING,
+    allowNull: true,
+  },
+  required: {
+    type: DataTypes.BOOLEAN,
+    defaultValue: false,
+  },
+  store_id: {
+    type: DataTypes.STRING,
+    allowNull: false,
+  },
+}, {
+  timestamps: false, // Disable createdAt and updatedAt
+});
+
+const StoreOption = sequelize.define('StoreOption', {
+  id: {
+    type: DataTypes.INTEGER,
+    primaryKey: true,
+    autoIncrement: true,
+  },
+  store_id: {
+    type: DataTypes.STRING,
+    allowNull: false,
+  },
+  product_id: {
+    type: DataTypes.INTEGER,
+    allowNull: false,
+  },
+  product_name: {
+    type: DataTypes.STRING,
+    allowNull: true,
+  },
+  options: {
+    type: DataTypes.JSON,
+    allowNull: false,
+  },
+  created_at: {
+    type: DataTypes.DATE,
+    defaultValue: Sequelize.NOW,
+  },
+}, {
+  timestamps: false,
+  tableName: 'store_options',
+});
+
+// Admin model for basic user/login information
+const Admin = sequelize.define('admins', {
+  id: { type: DataTypes.INTEGER, autoIncrement: true, primaryKey: true },
+  email: { type: DataTypes.STRING(255), allowNull: false, unique: true },
+  username: { type: DataTypes.STRING(100), allowNull: true },
+  password: { type: DataTypes.STRING(255), allowNull: false },
+  role: { type: DataTypes.STRING(50), allowNull: false, defaultValue: 'admin' }
+}, { timestamps: true });
+
+// Announcement model - platform-wide notices shown in the merchant app top bar
+const Announcement = sequelize.define('announcements', {
+  id: { type: DataTypes.INTEGER, autoIncrement: true, primaryKey: true },
+  title: { type: DataTypes.STRING(150), allowNull: false },
+  message: { type: DataTypes.STRING(1000), allowNull: false },
+  type: { type: DataTypes.ENUM('info', 'success', 'warning', 'error'), allowNull: false, defaultValue: 'info' },
+  active: { type: DataTypes.BOOLEAN, allowNull: false, defaultValue: false },
+  created_by: { type: DataTypes.INTEGER, allowNull: true },
+}, { timestamps: true });
+
+sequelize.sync({ alter: true }); // Synchronize models — alter: true adds missing columns to existing tables
+
+const { createBundleStockService, normalizeChildren, parseChildren, buildSlotOptions, buildMirroredOptions } = require('./services/bundleStock');
+const bundleStockService = createBundleStockService({ Bundle, Token, Notification, axios, ECDWID_API_URL });
+
+const uploadsDir = path.join(__dirname, 'downloads');
+if (!fs.existsSync(uploadsDir)) {
+  fs.mkdirSync(uploadsDir);
+}
+
+app.post('/api/upload-image', (req, res) => {
+  const busboy = Busboy({ headers: req.headers }); // No 'new' keyword here
+  let fileUrl = '';
+
+  busboy.on('file', (fieldname, file, filename, encoding, mimetype) => {
+    // Only process image files
+    /*if (!mimetype.startsWith('image/')) {
+      return res.status(400).json({ error: 'File must be an image' });
+    }*/
+
+    const filePath = path.join(uploadsDir, `${Date.now()}`);
+    fileUrl = `/downloads/${path.basename(filePath)}`;
+
+
+    // Pipe the file stream into the local file system
+    const writeStream = fs.createWriteStream(filePath);
+    pipeline(file, writeStream, (err) => {
+      if (err) {
+        console.error('File upload failed:', err);
+        return res.status(500).json({ error: 'Failed to upload image' });
+      }
+    });
+  });
+
+  busboy.on('finish', () => {
+    if (!fileUrl) {
+      return res.status(400).json({ error: 'No file uploaded' });
+    }
+    // Return the image URL in the response
+    res.json({ imageUrl: 'https://app.bundlefix.com/backend'+fileUrl });
+  });
+
+  req.pipe(busboy); // Pipe the incoming request to busboy
+});
+
+// API Token Middleware
+app.use((req, res, next) => {
+  const authHeader = req.headers['authorization'];
+  if (authHeader && authHeader.startsWith('Bearer ')) {
+    req.apiToken = authHeader.slice(7);
+    req.storeId = req.headers['store_id'];
+  }
+  next();
+});
+
+// Fetch products from Ecwid
+app.get('/api/products', async (req, res) => {
+  try {
+    const response = await axios.get(`${ECDWID_API_URL}/${req.storeId}/products`, {
+      headers: { Authorization: `Bearer ${req.apiToken}` }
+    });
+    res.json(response.data);
+  } catch (error) {
+    res.status(500).json({ error: error });
+  }
+});
+
+// Fetch products from Ecwid
+app.get('/api/product/:id', async (req, res) => {
+  const { id } = req.params;
+  try {
+    const response = await axios.get(`${ECDWID_API_URL}/${req.storeId}/products/${id}`, {
+      headers: { Authorization: `Bearer ${req.apiToken}` }
+    });
+
+    // Format the product data for editing
+    const product = response.data;
+    const formattedProduct = {
+      ...product,
+      originalImageUrl: product.imageUrl || '',
+      galleryImages: product.galleryImages ? product.galleryImages.map(img => ({ url: img.url })) : []
+    };
+
+    res.json(formattedProduct);
+  } catch (error) {
+    res.status(500).json({ error: error });
+  }
+});
+
+// Batch-fetch each product's custom Attributes (e.g. Color, Size) by id.
+// GET /api/products/attributes does not exist on Ecwid's list endpoint, so this
+// fetches per-product detail in parallel and returns a slim, id-keyed result -
+// used by the Bundles list to show child product attributes without N separate
+// requests from the frontend.
+app.get('/api/products/attributes', async (req, res) => {
+  const ids = (req.query.ids || '').split(',').map(s => s.trim()).filter(Boolean);
+  if (ids.length === 0) return res.json({ products: {} });
+
+  const results = await Promise.allSettled(
+    ids.map((id) =>
+      axios.get(`${ECDWID_API_URL}/${req.storeId}/products/${id}`, {
+        headers: { Authorization: `Bearer ${req.apiToken}` }
+      })
+    )
+  );
+
+  const products = {};
+  ids.forEach((id, i) => {
+    const result = results[i];
+    if (result.status !== 'fulfilled') {
+      console.warn(`Failed to fetch attributes for product ${id}:`, result.reason?.message);
+    }
+    products[id] = { attributes: result.status === 'fulfilled' ? (result.value.data.attributes || []) : [] };
+  });
+
+  res.json({ products });
+});
+
+// Update product
+app.put('/api/product/:id', async (req, res) => {
+  const { id } = req.params;
+  const { name, description, price, stock, costPrice, mainImage, galleryImages, unlimited, options } = req.body;
+
+  if (options) {
+    try {
+      const response = await axios.put(`https://app.ecwid.com/api/v3/${req.storeId}/products/${id}`, { options }, {
+        headers: { Authorization: `Bearer ${req.apiToken}` }
+      });
+      res.json(response.data);
+    } catch (error) {
+      res.status(500).json({ error: error.message });
+    }
+  }else {
+    try {
+      // Update basic product data
+      const response = await axios.put(`https://app.ecwid.com/api/v3/${req.storeId}/products/${id}`, {
+        quantity: parseInt(stock, 10),
+        name,
+        description,
+        price,
+        costPrice,
+        unlimited: Boolean(unlimited),
+      }, {
+        headers: {Authorization: `Bearer ${req.apiToken}`}
+      });
+
+      // Upload main image if provided
+      if (mainImage) {
+        try {
+          await axios.post(
+              `${ECDWID_API_URL}/${req.storeId}/products/${id}/image/async`,
+              {url: mainImage, width: 2500, height: 1500},
+              {headers: {Authorization: `Bearer ${req.apiToken}`}}
+          );
+        } catch (imageError) {
+          console.error("Main image upload failed:", imageError);
+          // Continue with the update, don't fail the whole request
+        }
+      }
+
+      // Replace gallery images when new gallery images are provided
+      if (galleryImages) {
+        try {
+          const productResponse = await axios.get(
+              `${ECDWID_API_URL}/${req.storeId}/products/${id}`,
+              {headers: {Authorization: `Bearer ${req.apiToken}`}}
+          );
+
+          const existingGallery = productResponse.data.galleryImages || [];
+          await Promise.all(
+              existingGallery.map(async (galleryImage) => {
+                const imageId = galleryImage.id || galleryImage.imageId || galleryImage.galleryImageId;
+                if (!imageId) return;
+                await axios.delete(
+                    `${ECDWID_API_URL}/${req.storeId}/products/${id}/gallery/${imageId}`,
+                    {headers: {Authorization: `Bearer ${req.apiToken}`}}
+                );
+              })
+          );
+        } catch (clearError) {
+          console.warn('Failed to clear existing gallery images:', clearError.message || clearError);
+        }
+
+        if (galleryImages.length > 0) {
+          try {
+            await Promise.all(
+                galleryImages.map(async (galleryImage) => {
+                  const imageUrl = typeof galleryImage === 'string' ? galleryImage : galleryImage?.url;
+                  if (!imageUrl) return;
+                  await axios.post(
+                      `${ECDWID_API_URL}/${req.storeId}/products/${id}/gallery/async`,
+                      {url: imageUrl, width: 2500, height: 1500},
+                      {headers: {Authorization: `Bearer ${req.apiToken}`}}
+                  );
+                })
+            );
+          } catch (galleryError) {
+            console.error("Gallery image upload failed:", galleryError);
+            // Continue with the update
+          }
+        }
+      }
+
+      res.json(response.data);
+    } catch (error) {
+      res.status(500).json({error: error.message});
+    }
+  }
+});
+
+// Update product variations
+/*app.put('/api/product/:id/combinations', async (req, res) => {
+  const { id } = req.params;
+  const { combinations } = req.body;
+  try {
+    const response = await axios.put(`https://app.ecwid.com/api/v3/${req.storeId}/products/${id}/combinations`, { combinations }, {
+      headers: { Authorization: `Bearer ${req.apiToken}` }
+    });
+    res.json(response.data);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});*/
+
+// Get product count between dates
+app.get('/api/products/count', async (req, res) => {
+  try {
+    const { from, to } = req.query;
+    if (!from || !to) {
+      return res.status(400).json({ error: 'Both from and to dates are required' });
+    }
+
+    // Validate dates
+    const startDate = new Date(from);
+    const endDate = new Date(to);
+    if (isNaN(startDate) || isNaN(endDate)) {
+      return res.status(400).json({ error: 'Invalid date format. Use YYYY-MM-DD' });
+    }
+    if (startDate > endDate) {
+      return res.status(400).json({ error: 'from date cannot be after to date' });
+    }
+
+    // Convert to Ecwid timestamps (seconds)
+    const createdFrom = Math.floor(startDate.getTime() / 1000);
+    const createdTo = Math.floor(endDate.getTime() / 1000) + 86399; // End of day
+
+    const response = await axios.get(`${ECDWID_API_URL}/${req.storeId}/products`, {
+      headers: { Authorization: `Bearer ${req.apiToken}` },
+      params: {
+        createdFrom,
+        createdTo,
+        limit: 0 // Get only total count
+      }
+    });
+
+    res.json({
+      count: response.data.total,
+      from: startDate.toISOString(),
+      to: endDate.toISOString()
+    });
+  } catch (error) {
+    handleApiError(error, res);
+  }
+});
+
+// NEW: Get graph data grouped by date with revenue, profit and total (shipping)
+app.get('/api/graph', async (req, res) => {
+  try {
+    const { from, to } = req.query;
+
+    // Validate input
+    if (!from || !to) {
+      return res.status(400).json({ error: 'Both "from" and "to" dates are required' });
+    }
+
+    const startDate = new Date(from);
+    const endDate = new Date(to);
+
+    if (isNaN(startDate.getTime()) || isNaN(endDate.getTime())) {
+      return res.status(400).json({ error: 'Invalid date format. Use YYYY-MM-DD.' });
+    }
+
+    if (startDate > endDate) {
+      return res.status(400).json({ error: '"from" date cannot be after "to" date.' });
+    }
+
+    // Format timestamps for Ecwid API (as UNIX time)
+    const createdFrom = Math.floor(startDate.getTime() / 1000);
+    const createdTo = Math.floor(endDate.getTime() / 1000) + 86399;
+
+    // Helper to extract YYYY-MM-DD from ISO date
+    const formatDate = (isoString) => {
+      const date = new Date(isoString);
+      if (isNaN(date.getTime())) return null;
+      return date.toISOString().split('T')[0]; // YYYY-MM-DD
+    };
+
+    const groups = {};
+    const limit = 100;
+    let offset = 0;
+
+    while (true) {
+      const response = await axios.get(`${ECDWID_API_URL}/${req.storeId}/orders`, {
+        headers: { Authorization: `Bearer ${req.apiToken}` },
+        params: {
+          createdFrom,
+          createdTo,
+          limit,
+          offset,
+        },
+      });
+
+      const orders = response.data.items || [];
+      if (orders.length === 0) break;
+
+      orders.forEach(order => {
+        const dateKey = formatDate(order.createDate); // Use ISO string
+
+        if (!dateKey) return;
+
+        const total = parseFloat(order.total) || 0;
+        const tax = parseFloat(order.tax) || 0;
+        const shipping = parseFloat(order.shipping) || 0;
+
+        const revenue = total - tax - shipping;
+
+        if (!groups[dateKey]) {
+          groups[dateKey] = { revenue: 0, shipping: 0 };
+        }
+
+        groups[dateKey].revenue += revenue;
+        groups[dateKey].shipping += shipping;
+      });
+
+      offset += limit;
+    }
+
+    // Final formatted output
+    const result = Object.entries(groups)
+        .sort(([a], [b]) => new Date(a) - new Date(b))
+        .map(([date, { revenue, shipping }]) => ({
+          date,
+          revenue: Number(revenue.toFixed(2)),
+          profit: Number((revenue - shipping).toFixed(2)),
+          total: Number(shipping.toFixed(2)), // shipping as "total"
+        }));
+
+    res.json(result);
+  } catch (error) {
+    console.error('API /api/graph error:', error.message);
+    handleApiError(error, res);
+  }
+});
+
+app.get('/api/products-stats', async (req, res) => {
+  try {
+    const { from, to } = req.query;
+
+    if (!from || !to) {
+      return res.status(400).json({ error: 'Both "from" and "to" dates are required' });
+    }
+
+    const startDate = new Date(from);
+    const endDate = new Date(to);
+
+    if (isNaN(startDate.getTime()) || isNaN(endDate.getTime())) {
+      return res.status(400).json({ error: 'Invalid date format. Use YYYY-MM-DD.' });
+    }
+
+    if (startDate > endDate) {
+      return res.status(400).json({ error: '"from" date cannot be after "to" date.' });
+    }
+
+    const createdFrom = Math.floor(startDate.getTime() / 1000);
+    const createdTo = Math.floor(endDate.getTime() / 1000) + 86399;
+
+    const productStats = {};
+    const limit = 100;
+    let offset = 0;
+
+    while (true) {
+      const response = await axios.get(`${ECDWID_API_URL}/${req.storeId}/orders`, {
+        headers: { Authorization: `Bearer ${req.apiToken}` },
+        params: {
+          createdFrom,
+          createdTo,
+          limit,
+          offset,
+        },
+      });
+
+      const orders = response.data.items || [];
+      if (orders.length === 0) break;
+
+      orders.forEach(order => {
+        const orderShipping = parseFloat(order.shipping) || 0;
+        const orderTax = parseFloat(order.tax) || 0;
+
+        const items = order.items || [];
+        const itemCount = items.length;
+
+        const shippingPerItem = itemCount > 0 ? orderShipping / itemCount : 0;
+        const taxPerItem = itemCount > 0 ? orderTax / itemCount : 0;
+
+        items.forEach(item => {
+          const quantity = item.quantity || 0;
+          const price = parseFloat(item.price) || 0;
+          const productName = item.name || 'Unnamed Product';
+
+          if (!productStats[productName]) {
+            productStats[productName] = {
+              productName,
+              quantitySold: 0,
+              productCost: 0,
+              revenue: 0,
+              shipping: 0,
+              tax: 0,
+            };
+          }
+
+          const revenue = price * quantity;
+          const shipping = shippingPerItem;
+          const tax = taxPerItem;
+
+          productStats[productName].quantitySold += quantity;
+          productStats[productName].productCost += (item.costPrice * quantity);
+          productStats[productName].revenue += revenue;
+          productStats[productName].shipping += shipping;
+          productStats[productName].tax += tax;
+        });
+      });
+
+      offset += limit;
+    }
+
+    const result = Object.values(productStats).map(p => ({
+      productName: p.productName,
+      quantitySold: p.quantitySold,
+      shipping: Number(p.shipping.toFixed(2)),
+      tax: Number(p.tax.toFixed(2)),
+      productCost: Number(p.productCost.toFixed(2)),
+      revenue: Number(p.revenue.toFixed(2)),
+      profit: Number((p.revenue - p.productCost - p.shipping - p.tax).toFixed(2)),
+    }));
+
+    res.json(result);
+  } catch (error) {
+    console.error('API /api/products-graph error:', error.message);
+    handleApiError(error, res);
+  }
+});
+
+
+
+// Get orders total between dates
+app.get('/api/orders/total', async (req, res) => {
+  try {
+    const { from, to } = req.query;
+    if (!from || !to) {
+      return res.status(400).json({ error: 'Both from and to dates are required' });
+    }
+
+    // Validate dates
+    const startDate = new Date(from);
+    const endDate = new Date(to);
+    if (isNaN(startDate) || isNaN(endDate)) {
+      return res.status(400).json({ error: 'Invalid date format. Use YYYY-MM-DD' });
+    }
+    if (startDate > endDate) {
+      return res.status(400).json({ error: 'from date cannot be after to date' });
+    }
+
+    // Convert to Ecwid timestamps
+    const createdFrom = Math.floor(startDate.getTime() / 1000);
+    const createdTo = Math.floor(endDate.getTime() / 1000) + 86399;
+
+    let totalAmount = 0;
+    let totalTax = 0;
+    let totalShipping = 0;
+    let totalRevenue = 0;
+    let offset = 0;
+    const limit = 100;
+
+    while (true) {
+      const response = await axios.get(`${ECDWID_API_URL}/${req.storeId}/orders`, {
+        headers: { Authorization: `Bearer ${req.apiToken}` },
+        params: {
+          createdFrom,
+          createdTo,
+          limit,
+          offset
+        }
+      });
+
+      const orders = response.data.items;
+      if (orders.length === 0) break;
+
+      // Process each order
+      orders.forEach(order => {
+        const orderTotal = parseFloat(order.total) || 0;
+        const orderTax = parseFloat(order.tax) || 0;
+        const orderShipping = parseFloat(order.shipping) || 0;
+
+        totalAmount += orderTotal;
+        totalTax += orderTax;
+        totalShipping += orderShipping;
+        totalRevenue += orderTotal - orderTax - orderShipping;
+      });
+
+      offset += limit;
+    }
+
+    const profit = totalRevenue - totalShipping; // Adjust this calculation based on your business logic
+
+    res.json({
+      total: totalAmount.toFixed(2),
+      tax: totalTax.toFixed(2),
+      shipping: totalShipping.toFixed(2),
+      revenue: totalRevenue.toFixed(2),
+      profit: profit.toFixed(2),
+      from: startDate.toISOString(),
+      to: endDate.toISOString()
+    });
+  } catch (error) {
+    handleApiError(error, res);
+  }
+});
+
+app.put('/api/product/:id/combinations', async (req, res) => {
+  const { id } = req.params;
+  const { combinations } = req.body;
+
+  try {
+    const responses = await Promise.all(combinations.map(async (combination) => {
+      const { id: combinationId, ...data } = combination;
+      const url = combinationId === 0
+          ? `https://app.ecwid.com/api/v3/${req.storeId}/products/${id}/combinations`
+          : `https://app.ecwid.com/api/v3/${req.storeId}/products/${id}/combinations/${combinationId}`;
+
+      console.log(url);
+      const method = combinationId === 0 ? 'post' : 'put';
+      const response = await axios({
+        method,
+        url,
+        data: combination,
+        headers: { Authorization: `Bearer ${req.apiToken}` }
+      });
+      return response.data;
+    }));
+
+    // console.log(response);
+    res.json(responses);
+  } catch (error) {
+    console.log(error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Update product discounts
+app.put('/api/product/:id/wholesale', async (req, res) => {
+  const { id } = req.params;
+  const { wholesalePrices } = req.body;
+  try {
+    const response = await axios.put(`https://app.ecwid.com/api/v3/${req.storeId}/products/${id}`, { wholesalePrices }, {
+      headers: { Authorization: `Bearer ${req.apiToken}` }
+    });
+    res.json(response.data);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// OAuth token exchange
+app.post('/api/oauth/token/', async (req, res) => {
+  const { code, client_id, client_secret, redirect_uri } = req.body;
+  if (!code) return res.status(400).send('Authorization code is missing.');
+
+  try {
+    const tokenResponse = await axios.post('https://my.ecwid.com/api/oauth/token', null, {
+      params: {
+        client_id,
+        client_secret,
+        code,
+        redirect_uri,
+        grant_type: 'authorization_code',
+      },
+    });
+
+    const { access_token, store_id } = tokenResponse.data;
+
+    await Token.destroy({ where: { store_id } });
+    await Token.create({ store_id, details: JSON.stringify(tokenResponse.data) });
+
+    const details = await StoreDetail.findOne( {where: { store_id: store_id}});
+    if(!details){
+      const futureDate = new Date();
+      futureDate.setDate(futureDate.getDate() + 7);
+
+      await StoreDetail.create({
+        store_id,
+        billing_name:'',
+        billing_email: tokenResponse.data.email,
+        billing_phone: '',
+        billing_address: '-',
+        billing_country: '',
+        billing_date: futureDate,
+        current_package: 1,
+        trial: 1,
+        active: 1,
+      });
+    }
+    res.json(tokenResponse.data);
+  } catch (error) {
+    console.error('Error fetching access token:', error.response ? error.response.data : error.message);
+    res.status(500).send('Failed to fetch access token.');
+  }
+});
+
+// Update product stock
+app.put('/api/products/:id/stock', async (req, res) => {
+  const { id } = req.params;
+  const { stock } = req.body;
+
+  try {
+    const response = await axios.put(
+        `${ECDWID_API_URL}/${req.storeId}/products/${id}`,
+        { quantity: parseInt(stock, 10), unlimited: false },
+        { headers: { Authorization: `Bearer ${req.apiToken}` } }
+    );
+    res.json(response.data);
+  } catch (error) {
+    handleApiError(error, res);
+  }
+});
+
+// Update product
+app.put('/api/products/:id/', async (req, res) => {
+  const { id } = req.params;
+  const { name,description, price,stock, costPrice } = req.body;
+
+  try {
+    const response = await axios.put(
+        `${ECDWID_API_URL}/${req.storeId}/products/${id}`,
+        { quantity: parseInt(stock, 10), name, description, price, costPrice },
+        { headers: { Authorization: `Bearer ${req.apiToken}` } }
+    );
+    res.json(response.data);
+  } catch (error) {
+    handleApiError(error, res);
+  }
+});
+
+// Delete product
+app.delete('/api/products/:id/', async (req, res) => {
+  const { id } = req.params;
+  try {
+    const response = await axios.delete(
+        `${ECDWID_API_URL}/${req.storeId}/products/${id}`,
+        { headers: { Authorization: `Bearer ${req.apiToken}` } }
+    );
+    await Bundle.destroy({ where: { ecwid_id: id } });
+    res.json(response.data);
+  } catch (error) {
+    handleApiError(error, res);
+  }
+});
+
+function buildFixedDescription(children, productsById) {
+  const lines = children
+    .map((child) => {
+      const p = productsById[child.productId];
+      return p ? `• ${p.name} x${child.qty}` : null;
+    })
+    .filter(Boolean);
+  return lines.length > 0 ? `Includes:\n${lines.join('\n')}` : '-';
+}
+
+// Create a bundle
+app.post('/api/bundles', async (req, res) => {
+  const { name, productIds, discount, sku, bundleImages, mainImage, costPrice, bundleType } = req.body;
+
+  // Accept either [{ productId, qty }] (new shape) or plain ids (legacy/back-compat) - qty defaults to 1.
+  const children = normalizeChildren(productIds).map((c) => ({
+    productId: c.productId,
+    qty: Math.max(1, parseInt(c.qty, 10) || 1),
+  }));
+
+  if (children.length === 0) {
+    return res.status(400).json({ error: 'Product IDs cannot be empty' });
+  }
+
+  try {
+    // Fetch each child's full detail (not the list endpoint) - we need each
+    // child's own `options` (Size/Color etc.) to mirror onto the bundle, and
+    // the list endpoint doesn't include them.
+    const detailResponses = await Promise.all(
+        children.map((child) =>
+            axios.get(`${ECDWID_API_URL}/${req.storeId}/products/${child.productId}`, {
+              headers: { Authorization: `Bearer ${req.apiToken}` }
+            })
+        )
+    );
+    const itemsById = {};
+    detailResponses.forEach((r) => { itemsById[r.data.id] = r.data; });
+
+    // Base price = sum(childPrice * qty), discounted; cost price defaults the same way when not supplied.
+    let basePrice = children.reduce((acc, child) => acc + (itemsById[child.productId]?.price || 0) * child.qty, 0);
+    const discountValue = discount ? discount / 100 : 0;
+    basePrice = Math.round(basePrice * (1 - discountValue) * 100) / 100;
+
+    const resolvedCostPrice = costPrice !== undefined && costPrice !== null && costPrice !== ''
+        ? parseFloat(costPrice)
+        : Math.round(children.reduce((acc, child) => acc + (itemsById[child.productId]?.costPrice || 0) * child.qty, 0) * 100) / 100;
+
+    const type = bundleType === 'fixed' ? 'fixed' : 'flexible';
+    const productOptions = type === 'fixed' ? buildMirroredOptions(children, itemsById) : buildSlotOptions(children, itemsById);
+    const description = type === 'fixed' ? buildFixedDescription(children, itemsById) : '-';
+
+    // Save bundle in database
+    const bundle = await Bundle.create({
+      name,
+      product_ids: JSON.stringify(children),
+      store_id: req.storeId,
+      discount,
+      sku,
+      price: basePrice,
+      costPrice: resolvedCostPrice,
+      bundle_type: type,
+    });
+
+    // Create product in Ecwid
+    const ecwidProduct = await axios.post(
+        `${ECDWID_API_URL}/${req.storeId}/products`,
+        {
+          name,
+          price: basePrice,
+          description,
+          enabled: true,
+          sku,
+          costPrice: resolvedCostPrice,
+          unlimited: false,
+          quantity: 1,
+          options: productOptions
+        },
+        { headers: { Authorization: `Bearer ${req.apiToken}` } }
+    );
+
+    // Update bundle with Ecwid product ID
+    await bundle.update({ ecwid_id: ecwidProduct.data.id });
+
+    // Compute and push the bundle's initial stock from its children right away,
+    // rather than waiting for the next webhook/cron tick.
+    try {
+      await bundleStockService.syncBundleStock(req.storeId, bundle, req.apiToken);
+    } catch (stockError) {
+      console.warn('Initial bundle stock sync failed:', stockError.message);
+    }
+
+    // Upload main image (if available)
+    if (mainImage) {
+      try {
+        await axios.post(
+            `${ECDWID_API_URL}/${req.storeId}/products/${ecwidProduct.data.id}/image/async`,
+            { url: mainImage, width: 2500, height: 1500 },
+            { headers: { Authorization: `Bearer ${req.apiToken}` } }
+        );
+      } catch (mainImageError) {
+        console.warn("Main image upload failed:", mainImageError.message);
+      }
+    }
+
+    // Upload gallery images (if available)
+    if (bundleImages.length > 0) {
+      const uploadResults = await Promise.allSettled(
+          bundleImages.map(bundleImage =>
+              axios.post(
+                  `${ECDWID_API_URL}/${req.storeId}/products/${ecwidProduct.data.id}/gallery/async`,
+                  { url: bundleImage, width: 2500, height: 1500 },
+                  { headers: { Authorization: `Bearer ${req.apiToken}` } }
+              )
+          )
+      );
+
+      const failedUploads = uploadResults.filter(result => result.status === "rejected");
+      if (failedUploads.length > 0) {
+        console.warn(`Some gallery images failed to upload:`, failedUploads.length);
+      }
+    }
+
+    res.json(bundle);
+  } catch (error) {
+    handleApiError(error, res);
+  }
+});
+
+// Update a bundle
+app.put('/api/bundles/:id/', async (req, res) => {
+  const { id } = req.params;
+  const { name, productIds, discount, sku, bundleImages, mainImage, costPrice, bundleType } = req.body;
+
+  const children = normalizeChildren(productIds).map((c) => ({
+    productId: c.productId,
+    qty: Math.max(1, parseInt(c.qty, 10) || 1),
+  }));
+
+  if (children.length === 0) {
+    return res.status(400).json({ error: 'Product IDs cannot be empty' });
+  }
+
+  try {
+    // Fetch each child's full detail (not the list endpoint) - we need each
+    // child's own `options` (Size/Color etc.) to mirror onto the bundle, and
+    // the list endpoint doesn't include them.
+    const detailResults = await Promise.allSettled(
+        children.map((child) =>
+            axios.get(`${ECDWID_API_URL}/${req.storeId}/products/${child.productId}`, {
+              headers: { Authorization: `Bearer ${req.apiToken}` }
+            })
+        )
+    );
+
+    if (detailResults.some((r) => r.status === 'rejected')) {
+      return res.status(400).json({ error: 'Some products could not be found' });
+    }
+
+    const itemsById = {};
+    detailResults.forEach((r) => { itemsById[r.value.data.id] = r.value.data; });
+
+    let price = children.reduce((acc, child) => acc + (itemsById[child.productId]?.price || 0) * child.qty, 0);
+    price = Math.round(price * (1 - (discount / 100)) * 100) / 100;
+
+    const resolvedCostPrice = costPrice !== undefined && costPrice !== null && costPrice !== ''
+        ? parseFloat(costPrice)
+        : Math.round(children.reduce((acc, child) => acc + (itemsById[child.productId]?.costPrice || 0) * child.qty, 0) * 100) / 100;
+
+    const type = bundleType === 'fixed' ? 'fixed' : 'flexible';
+    const productOptions = type === 'fixed' ? buildMirroredOptions(children, itemsById) : buildSlotOptions(children, itemsById);
+    const description = type === 'fixed' ? buildFixedDescription(children, itemsById) : '-';
+
+    const bundle = await Bundle.findByPk(id);
+    if (bundle) {
+      await bundle.update({ name, product_ids: JSON.stringify(children), discount, sku, price, costPrice: resolvedCostPrice, bundle_type: type });
+
+      const ecwidProduct = await axios.put(
+          `${ECDWID_API_URL}/${req.storeId}/products/${bundle.ecwid_id}`,
+          { name, price, description, enabled: true, sku, costPrice: resolvedCostPrice, options: productOptions },
+          { headers: { Authorization: `Bearer ${req.apiToken}` } }
+      );
+
+      // Children/quantities may have changed - recompute the bundle's stock immediately.
+      try {
+        await bundleStockService.syncBundleStock(req.storeId, bundle, req.apiToken);
+      } catch (stockError) {
+        console.warn('Bundle stock sync on update failed:', stockError.message);
+      }
+
+      try {
+        if(mainImage != '') {
+          await axios.post(
+              `${ECDWID_API_URL}/${req.storeId}/products/${bundle.ecwid_id}/image/async`,
+              {url: `${mainImage}`, width: 2500, height: 1500},
+              {headers: {Authorization: `Bearer ${req.apiToken}`}}
+          );
+        }
+        await Promise.all(
+            bundleImages.map(async (bundleImage, index) => {
+              await axios.post(
+                  `${ECDWID_API_URL}/${req.storeId}/products/${bundle.ecwid_id}/gallery/async`,
+                  { url: `${bundleImage}`, width: 2500, height: 1500 },
+                  { headers: { Authorization: `Bearer ${req.apiToken}` } }
+              );
+            })
+        );
+      } catch (imageError) {
+        console.error("Image download failed:", imageError);
+        return res.status(500).json({ error: 'Some image downloads failed' });
+      }
+
+
+      res.json(bundle);
+    } else {
+      res.status(404).json({ error: 'Bundle not found' });
+    }
+  } catch (error) {
+    handleApiError(error, res);
+  }
+});
+
+// Delete a bundle
+app.delete('/api/bundles/:id/', async (req, res) => {
+  const { id } = req.params;
+
+  try {
+    const bundle = await Bundle.findByPk(id);
+    if (bundle) {
+      await axios.delete(`${ECDWID_API_URL}/${req.storeId}/products/${bundle.ecwid_id}`, {
+        headers: { Authorization: `Bearer ${req.apiToken}` }
+      });
+      await bundle.destroy();
+      res.json({ message: 'Bundle deleted successfully' });
+    } else {
+      res.status(404).json({ error: 'Bundle not found' });
+    }
+  } catch (error) {
+    handleApiError(error, res);
+  }
+});
+
+// Get all bundles
+app.get('/api/bundles', async (req, res) => {
+  try {
+    const bundles = await Bundle.findAll({ where: { store_id: req.storeId } });
+    res.json({ bundles, total: bundles.length });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to fetch bundles' });
+  }
+});
+
+// Manually force a bundle's stock to be recomputed from its children right now
+// (used by the frontend's "Refresh stock" action; also useful for testing
+// without waiting for a webhook or the cron reconciliation pass).
+app.post('/api/bundles/:id/sync-stock', async (req, res) => {
+  try {
+    const bundle = await Bundle.findByPk(req.params.id);
+    if (!bundle || bundle.store_id !== req.storeId) {
+      return res.status(404).json({ error: 'Bundle not found' });
+    }
+    const stock = await bundleStockService.syncBundleStock(req.storeId, bundle, req.apiToken);
+    res.json({ success: true, stock, bundle });
+  } catch (error) {
+    console.error('Error syncing bundle stock:', error);
+    res.status(500).json({ error: 'Failed to sync bundle stock' });
+  }
+});
+
+//get all billing
+app.get('/api/billing', async (req, res) => {
+  try {
+    const page = Math.max(parseInt(req.query.page, 10) || 1, 1)
+    const limit = Math.max(parseInt(req.query.limit, 10) || 20, 1)
+    const offset = (page - 1) * limit
+    const query = {}
+    if (req.storeId) query.store_id = req.storeId
+
+    // allow search by q: bill id, store id, or store billing name/email
+    const q = (req.query.q || '').trim()
+    if (q) {
+      const qNum = parseInt(q, 10)
+      // find matching stores by name/email
+      const matchingStores = await StoreDetail.findAll({
+        where: {
+          [Sequelize.Op.or]: [
+            { billing_name: { [Sequelize.Op.like]: `%${q}%` } },
+            { billing_email: { [Sequelize.Op.like]: `%${q}%` } },
+          ],
+        },
+      })
+      const ids = matchingStores.map((s) => s.store_id)
+      const orConditions = []
+      if (!Number.isNaN(qNum)) orConditions.push({ bill_id: qNum }, { store_id: qNum })
+      if (ids.length) orConditions.push({ store_id: { [Sequelize.Op.in]: ids } })
+      if (orConditions.length) {
+        query[Sequelize.Op.or] = orConditions
+      }
+    }
+
+    const { count, rows } = await Bill.findAndCountAll({
+      where: query,
+      order: [['bill_id', 'DESC']],
+      limit,
+      offset,
+    })
+
+    const bills = rows.map((bill) => bill.toJSON())
+    const storeIds = [...new Set(bills.map((bill) => bill.store_id).filter(Boolean))]
+    const storeDetails = storeIds.length
+      ? await StoreDetail.findAll({ where: { store_id: storeIds } })
+      : []
+
+    const storeInfoById = storeDetails.reduce((acc, detail) => {
+      acc[detail.store_id] = {
+        storeName: detail.billing_name || '',
+        storeEmail: detail.billing_email || '',
+        storeBillingDate: detail.billing_date || null,
+        storeStartDate: detail.created_at ? new Date(detail.created_at).toISOString().split('T')[0] : null,
+      }
+      return acc
+    }, {})
+
+    const enriched = bills.map((bill) => ({
+      ...bill,
+      storeName: storeInfoById[bill.store_id]?.storeName || '',
+      storeEmail: storeInfoById[bill.store_id]?.storeEmail || '',
+      storeBillingDate: storeInfoById[bill.store_id]?.storeBillingDate || null,
+      storeStartDate: storeInfoById[bill.store_id]?.storeStartDate || null,
+    }))
+
+    const openInvoices = await Bill.count({
+      where: {
+        ...query,
+        status: { [Op.ne]: 'Paid' },
+      },
+    })
+
+    res.json({
+      bills: enriched,
+      page,
+      limit,
+      total: count,
+      pages: Math.max(Math.ceil(count / limit), 1),
+      openInvoices,
+    })
+  } catch (error) {
+    console.error('Error fetching billing:', error)
+    res.status(500).json({ error: 'Failed to fetch billing' })
+  }
+});
+
+
+app.post('/api/billing/update', async (req, res) => {
+  try {
+    if (!req.storeId) {
+      return res.status(400).json({ error: 'Missing store ID' });
+    }
+
+    const bill = await Bill.findOne({
+      where: { store_id: req.storeId, status: 'Pending' },
+      order: [['bill_id', 'DESC']],
+    });
+
+    if(!bill){
+      const details = await StoreDetail.findOne( {where: { store_id: req.storeId }});
+      let bill = await Bill.create({
+        store_id: req.storeId,
+        url: '-',
+        trans_id: '-',
+        status: 'Pending',
+        tans_data: '',
+        due_date: details.billing_date,
+        amount: 12.00,
+      });
+    }
+
+    res.json({bill:bill});
+  }catch (error) {
+    console.error('Error fetching billing:', error);
+    res.status(500).json({ error: 'Failed to fetch billing' });
+  }
+});
+
+//get bill detail
+app.get('/api/billing/:id', async (req, res) => {
+  const { id } = req.params;
+  try {
+    if (!req.storeId) {
+      return res.status(400).json({ error: 'Missing store ID' });
+    }
+
+    const bill = await Bill.findByPk(id);
+    if (!bill) {
+      return res.status(404).json({ error: 'Bill not found' });
+    }
+
+    res.json({bill});
+  }catch (error) {
+    console.error('Error fetching billing:', error);
+    res.status(500).json({ error: 'Failed to fetch billing' });
+  }
+});
+
+app.post('/api/discount/validate', async (req, res) => {
+  try {
+    const {billId, amount, code} = req.body;
+    // res.json({billId:billId, code:code});
+    // Fetch bill details
+    const bill = await Bill.findByPk(billId);
+    if (!bill) return res.status(404).json({ message: 'Bill not found' });
+
+    if(code == "CHECKDISCOUNT") {
+      await bill.update({amount: 1.0});
+      const discountAmount = amount - 1.00;
+      const finalAmount = 1.00;
+      res.json({
+        valid: true,
+        discountAmount: discountAmount.toFixed(2),
+        finalAmount: finalAmount.toFixed(2),
+        message: 'Discount applied! Amount reduced to $1.00',
+        billId: billId
+      });
+    }else{
+      res.json({
+        valid: false,
+        message: 'Invalid discount code. Please try again',
+        billId: billId
+      });
+    }
+
+
+
+  } catch (error) {
+    res.status(500).json({valid:false, message: error.message});
+  }
+
+});
+
+app.post('/api/billing/:id/pay', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { name, email, paymentMethodId } = req.body.paymentDetails;
+
+    // Fetch bill details
+    const bill = await Bill.findByPk(id);
+    if (!bill) return res.status(404).json({ error: 'Bill not found' });
+
+    // Create a Stripe customer (if not exists)
+    let customer = await stripe.customers.list({ email });
+    if (customer.data.length === 0) {
+      customer = await stripe.customers.create({ name, email });
+    } else {
+      customer = customer.data[0];
+    }
+
+    // Create PaymentIntent
+    const paymentIntent = await stripe.paymentIntents.create({
+      amount: Math.round(bill.amount * 100), // Convert to cents
+      currency: 'usd',
+      customer: customer.id,
+      payment_method: paymentMethodId,
+      confirm: true,
+      automatic_payment_methods: {
+        enabled: true,
+        allow_redirects: 'never' // Ensures only card-based payments
+      }
+    });
+
+    // Update bill status
+    if (paymentIntent.status === 'succeeded') {
+      await bill.update({ status: 'Paid', trans_id: paymentIntent.id, tans_data: JSON.stringify(paymentIntent) });
+      // Add one month to the bill's due_date
+      const currentDueDate = new Date(bill.due_date);
+      const newDueDate = new Date(currentDueDate.setMonth(currentDueDate.getMonth() + 1));
+
+      // Update the store details
+      await StoreDetail.update(
+          { trial: 0, billing_date: newDueDate, active: 1 },
+          { where: { store_id: bill.store_id } }
+      );
+    }
+
+    res.json({ success: true, paymentIntent });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+
+//payment webhook
+app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
+  const sig = req.headers['stripe-signature'];
+  let event;
+
+  try {
+    event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET);
+  } catch (err) {
+    console.error('Webhook signature verification failed.', err.message);
+    return res.status(400).send(`Webhook Error: ${err.message}`);
+  }
+
+  // Handle different event types
+  switch (event.type) {
+    case 'payment_intent.succeeded':
+      const paymentIntent = event.data.object;
+      console.log(`Payment successful: ${paymentIntent.id}`);
+
+      // Update bill as Paid
+     const bill = await Bill.findOne(
+        { where: { trans_id: paymentIntent.id } }
+    );
+      await bill.update(
+          { status: 'Paid', trans_id: paymentIntent.id, tans_data: JSON.stringify(paymentIntent) }
+      );
+
+      // Add one month to the bill's due_date
+      const currentDueDate = new Date(bill.due_date);
+      const newDueDate = new Date(currentDueDate.setMonth(currentDueDate.getMonth() + 1));
+
+      // Update the store details
+      await StoreDetail.update(
+          { trial: 0, billing_date: newDueDate, active: 1 },
+          { where: { store_id: bill.store_id } }
+      );
+      break;
+
+    case 'payment_intent.payment_failed':
+      const failedIntent = event.data.object;
+      console.log(`Payment failed: ${failedIntent.id}`);
+
+      // Update bill as Failed
+      await Bill.update(
+          { status: 'Failed', trans_id: failedIntent.id, tans_data: JSON.stringify(failedIntent) },
+          { where: { trans_id: failedIntent.id } }
+      );
+      break;
+
+    case 'charge.refunded':  // Refund Event
+      const refund = event.data.object;
+      console.log(`Refund issued: ${refund.payment_intent}`);
+
+      // Update bill as Refunded
+      await Bill.update(
+          { status: 'Refunded', tans_data: JSON.stringify(refund) },
+          { where: { trans_id: refund.payment_intent } }
+      );
+      break;
+
+    default:
+      console.log(`Unhandled event type: ${event.type}`);
+  }
+
+  res.json({ received: true });
+});
+
+
+//get store detail
+app.get('/api/store/', async (req, res) => {
+  try {
+    if (!req.storeId) {
+      return res.status(400).json({ error: 'Missing store ID' });
+    }
+
+    const details = await StoreDetail.findOne( {where: { store_id: req.storeId }});
+
+    const store = await axios.get(
+        `${ECDWID_API_URL}/${req.storeId}/profile`,
+        { headers: { Authorization: `Bearer ${req.apiToken}` } }
+    );
+
+    console.log(store.data);
+    res.json({details, store: store.data});
+  }catch (error) {
+    console.error('Error fetching details:', error);
+    res.status(500).json({ error: 'Failed to fetch details' });
+  }
+});
+
+app.put('/api/store/', async (req, res) => {
+  try {
+    const { billing_address, billing_country, billing_email, billing_name, billing_phone, store_id } = req.body;
+    if (!req.storeId) {
+      return res.status(400).json({ error: 'Missing store ID' });
+    }
+
+    const details = await StoreDetail.findOne( {where: { store_id: req.storeId }});
+    if (!details) {
+      res.status(404).json({error: 'No details found'});
+    }else{
+      await StoreDetail.update(
+          { billing_address,
+            billing_email,
+            billing_country,
+            billing_name,
+            billing_phone
+          },
+          { where: { store_id: store_id } }
+      );
+    }
+
+    res.json({details});
+  }catch (error) {
+    console.error('Error fetching details:', error);
+    res.status(500).json({ error: 'Failed to fetch details' });
+  }
+});
+
+//get all notifications
+app.get('/api/notifications', async (req, res) => {
+  try {
+    let { page = 1, limit = 10, sort = 'createdAt', order = 'DESC' } = req.query;
+
+    // Ensure numeric values
+    page = Math.max(1, parseInt(page, 10));
+    limit = Math.max(1, parseInt(limit, 10));
+    const offset = (page - 1) * limit;
+
+    // Validate sorting fields to prevent SQL injection risks
+    const allowedSortFields = ['createdAt', 'updatedAt', 'title']; // Add relevant fields
+    const allowedOrderValues = ['ASC', 'DESC'];
+
+    if (!allowedSortFields.includes(sort)) {
+      return res.status(400).json({ error: 'Invalid sort field' });
+    }
+
+    if (!allowedOrderValues.includes(order.toUpperCase())) {
+      return res.status(400).json({ error: 'Invalid order value' });
+    }
+
+    // Ensure store_id exists
+    if (!req.storeId) {
+      return res.status(400).json({ error: 'Missing store ID' });
+    }
+
+    // Fetch paginated notifications
+    const notifications = await Notification.findAll({
+      where: { store_id: req.storeId },
+      limit,
+      offset,
+      order: [[sort, order.toUpperCase()]],
+    });
+
+    // Count total notifications
+    const totalCount = await Notification.count({
+      where: { store_id: req.storeId },
+    });
+
+    // Count only unread notifications
+    const unreadCount = await Notification.count({
+      where: { store_id: req.storeId, read_flag: 0 },
+    });
+
+    res.json({ notifications, totalCount, unreadCount, page, limit });
+  } catch (error) {
+    console.error('Error fetching notifications:', error);
+    res.status(500).json({ error: 'Failed to fetch notifications' });
+  }
+});
+
+// Update a notification
+app.put('/api/notifications/:id', async (req, res) => {
+  const { id } = req.params;
+  const {read} = req.body;
+
+  try {
+    const notification = await Notification.findByPk(id);
+    if (!notification) {
+      return res.status(404).json({ error: 'Notification not found' });
+    }
+
+    // Update notification fields
+    await notification.update({
+      read_flag: read !== undefined ? read : notification.read_flag
+    });
+
+    res.json({ message: 'Notification updated successfully', notification });
+  } catch (error) {
+    console.error('Error updating notification:', error);
+    res.status(500).json({ error: 'Failed to update notification' });
+  }
+});
+
+// Fetch all options for a store
+app.get('/api/options', async (req, res) => {
+  try {
+    const store_id  = req.storeId; // Get store_id from query params
+    console.log("storeid this is:",req.storeId);
+    if (!store_id) {
+      return res.status(400).json({ error: 'store_id is required' });
+    }
+
+    const options = await Option.findAll({ where: { store_id } });
+    res.status(200).json(options);
+  } catch (error) {
+    console.error('Error fetching options:', error);
+    res.status(500).json({ error: 'Failed to fetch options' });
+  }
+});
+
+// Create a new option
+app.post('/api/options', async (req, res) => {
+  try {
+    const { name, type, values, default_value, required } = req.body;
+    const store_id = req.storeId;
+
+    if (!name || !type || !values) {
+      return res.status(400).json({ error: 'name, type, values, and store_id are required' });
+    }
+
+    const newOption = await Option.create({
+      name,
+      type,
+      values,
+      default_value,
+      required,
+      store_id,
+    });
+    
+    res.status(201).json(newOption);
+  } catch (error) {
+    console.error('Error creating option:', error);
+    res.status(500).json({ error: 'Failed to create option' });
+  }
+});
+
+// Update an existing option
+app.put('/api/options/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { name, type, values, default_value, required } = req.body;
+
+    const option = await Option.findByPk(id);
+    if (!option) {
+      return res.status(404).json({ error: 'Option not found' });
+    }
+
+    option.name = name || option.name;
+    option.type = type || option.type;
+    option.values = values || option.values;
+    option.default_value = default_value || option.default_value;
+    option.required = required || option.required;
+
+    await option.save();
+    res.status(200).json(option);
+  } catch (error) {
+    console.error('Error updating option:', error);
+    res.status(500).json({ error: 'Failed to update option' });
+  }
+});
+
+// Delete an option
+app.delete('/api/options/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const option = await Option.findByPk(id);
+    if (!option) {
+      return res.status(404).json({ error: 'Option not found' });
+    }
+
+    await option.destroy();
+    res.status(204).send(); // No content
+  } catch (error) {
+    console.error('Error deleting option:', error);
+    res.status(500).json({ error: 'Failed to delete option' });
+  }
+});
+
+// Store Options Management - Get all store options
+app.get('/api/store-options', async (req, res) => {
+  try {
+    const store_id = req.storeId;
+    if (!store_id) {
+      return res.status(400).json({ error: 'store_id is required' });
+    }
+
+    const storeOptions = await StoreOption.findAll({
+      where: { store_id },
+      order: [['created_at', 'DESC']],
+    });
+
+    res.status(200).json(storeOptions);
+  } catch (error) {
+    console.error('Error fetching store options:', error);
+    res.status(500).json({ error: 'Failed to fetch store options' });
+  }
+});
+
+// Store Options Management - Create store option assignment
+app.post('/api/store-options', async (req, res) => {
+  try {
+    const { product_id, product_name, options } = req.body;
+    const store_id = req.storeId;
+
+    if (!product_id || !options || options.length === 0) {
+      return res.status(400).json({ error: 'product_id and options are required' });
+    }
+
+    if (!store_id) {
+      return res.status(400).json({ error: 'store_id is required' });
+    }
+
+    const storeOption = await StoreOption.create({
+      store_id,
+      product_id,
+      product_name,
+      options,
+    });
+
+    res.status(201).json(storeOption);
+  } catch (error) {
+    console.error('Error creating store option:', error);
+    res.status(500).json({ error: 'Failed to create store option' });
+  }
+});
+
+// Store Options Management - Delete store option
+app.delete('/api/store-options/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const store_id = req.storeId;
+
+    if (!store_id) {
+      return res.status(400).json({ error: 'store_id is required' });
+    }
+
+    const storeOption = await StoreOption.findOne({
+      where: { id, store_id },
+    });
+
+    if (!storeOption) {
+      return res.status(404).json({ error: 'Store option not found' });
+    }
+
+    await storeOption.destroy();
+    res.status(204).send();
+  } catch (error) {
+    console.error('Error deleting store option:', error);
+    res.status(500).json({ error: 'Failed to delete store option' });
+  }
+});
+
+// --- Admin authentication routes ---
+const JWT_SECRET = process.env.JWT_SECRET || 'change_this_secret';
+
+function authenticateAdmin(req, res, next) {
+  const authHeader = req.headers['authorization'];
+  if (!authHeader) return res.status(401).json({ error: 'Missing authorization header' });
+  const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : authHeader;
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET);
+    req.adminAuth = decoded;
+    next();
+  } catch (err) {
+    return res.status(401).json({ error: 'Invalid or expired token' });
+  }
+}
+
+// Register admin
+app.post('/api/admin/register', async (req, res) => {
+  try {
+    const { email, username, password } = req.body;
+    if (!email || !password) return res.status(400).json({ error: 'email and password are required' });
+
+    const existing = await Admin.findOne({ where: { email } });
+    if (existing) return res.status(400).json({ error: 'User already exists' });
+
+    const hash = await bcrypt.hash(password, 10);
+    const admin = await Admin.create({ email, username: username || null, password: hash });
+    res.json({ success: true, id: admin.id });
+  } catch (error) {
+    console.error('Admin register error:', error.message);
+    res.status(500).json({ error: 'Failed to register admin' });
+  }
+});
+
+// Login admin
+app.post('/api/admin/login', async (req, res) => {
+  try {
+    const { email, password } = req.body;
+    if (!email || !password) return res.status(400).json({ error: 'email and password are required' });
+
+    const admin = await Admin.findOne({ where: { email } });
+    if (!admin) return res.status(401).json({ error: 'Invalid credentials' });
+
+    const match = await bcrypt.compare(password, admin.password);
+    if (!match) return res.status(401).json({ error: 'Invalid credentials' });
+
+    const token = jwt.sign({ id: admin.id, email: admin.email, role: admin.role }, JWT_SECRET, { expiresIn: '7d' });
+    res.json({ token });
+  } catch (error) {
+    console.error('Admin login error:', error.message);
+    res.status(500).json({ error: 'Failed to login' });
+  }
+});
+
+// Get current admin
+app.get('/api/admin/me', authenticateAdmin, async (req, res) => {
+  try {
+    const admin = await Admin.findByPk(req.adminAuth.id, { attributes: { exclude: ['password'] } });
+    if (!admin) return res.status(404).json({ error: 'Admin not found' });
+    res.json({ admin });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to fetch admin' });
+  }
+});
+
+// Update current admin (name/email/password)
+app.put('/api/admin/me', authenticateAdmin, async (req, res) => {
+  try {
+    const { email, username, currentPassword, newPassword } = req.body;
+    const admin = await Admin.findByPk(req.adminAuth.id);
+    if (!admin) return res.status(404).json({ error: 'Admin not found' });
+
+    // Update email/username
+    const updates = {};
+    if (email && email !== admin.email) {
+      const existing = await Admin.findOne({ where: { email } });
+      if (existing && existing.id !== admin.id) {
+        return res.status(400).json({ error: 'Email already in use' });
+      }
+      updates.email = email;
+    }
+    if (username && username !== admin.username) {
+      updates.username = username;
+    }
+
+    // Handle password change if requested
+    if (newPassword) {
+      if (!currentPassword) {
+        return res.status(400).json({ error: 'currentPassword is required to change password' });
+      }
+      const match = await bcrypt.compare(currentPassword, admin.password);
+      if (!match) return res.status(401).json({ error: 'Current password is incorrect' });
+      const hash = await bcrypt.hash(newPassword, 10);
+      updates.password = hash;
+    }
+
+    await admin.update(updates);
+    const safe = await Admin.findByPk(admin.id, { attributes: { exclude: ['password'] } });
+    res.json({ success: true, admin: safe, message: newPassword ? 'Profile and password updated' : 'Profile updated' });
+  } catch (error) {
+    console.error('Admin update error:', error);
+    res.status(500).json({ error: 'Failed to update admin' });
+  }
+});
+
+// Get all stores (store details) with pagination
+app.get('/api/stores', authenticateAdmin, async (req, res) => {
+  try {
+    const page = Math.max(parseInt(req.query.page, 10) || 1, 1)
+    const limit = Math.max(parseInt(req.query.limit, 10) || 20, 1)
+    const offset = (page - 1) * limit
+
+    const where = {}
+    const q = (req.query.q || '').trim()
+    if (q) {
+      const qNum = parseInt(q, 10)
+      where[Sequelize.Op.or] = [
+        { billing_name: { [Sequelize.Op.like]: `%${q}%` } },
+        { billing_email: { [Sequelize.Op.like]: `%${q}%` } },
+      ]
+      if (!Number.isNaN(qNum)) where[Sequelize.Op.or].push({ store_id: qNum })
+    }
+
+    const { count, rows } = await StoreDetail.findAndCountAll({
+      where,
+      order: [['det_id', 'DESC']],
+      limit,
+      offset,
+    })
+
+    res.json({
+      stores: rows,
+      page,
+      limit,
+      total: count,
+      pages: Math.max(Math.ceil(count / limit), 1),
+    })
+  } catch (error) {
+    console.error('Error fetching stores:', error)
+    res.status(500).json({ error: 'Failed to fetch stores' })
+  }
+})
+
+// Toggle store active status
+app.put('/api/stores/:id/toggle-active', authenticateAdmin, async (req, res) => {
+  try {
+    const { id } = req.params
+    const { active } = req.body
+
+    if (active === undefined) {
+      return res.status(400).json({ error: 'active field is required' })
+    }
+
+    const store = await StoreDetail.findOne({
+      where: { store_id: id }
+    })
+
+    if (!store) {
+      return res.status(404).json({ error: 'Store not found' })
+    }
+
+    await store.update({ active: Boolean(active) })
+
+    res.json({
+      success: true,
+      message: `Store ${active ? 'activated' : 'deactivated'} successfully`,
+      store: store
+    })
+  } catch (error) {
+    console.error('Error toggling store status:', error)
+    res.status(500).json({ error: 'Failed to toggle store status' })
+  }
+})
+
+// Edit store billing/package details
+app.put('/api/stores/:id', authenticateAdmin, async (req, res) => {
+  try {
+    const { id } = req.params
+    const store = await StoreDetail.findOne({ where: { store_id: id } })
+    if (!store) {
+      return res.status(404).json({ error: 'Store not found' })
+    }
+
+    const editable = ['billing_name', 'billing_email', 'billing_phone', 'billing_address', 'billing_country', 'current_package', 'trial']
+    const updates = {}
+    editable.forEach((field) => {
+      if (req.body[field] !== undefined) updates[field] = req.body[field]
+    })
+
+    await store.update(updates)
+    res.json({ success: true, store })
+  } catch (error) {
+    console.error('Error updating store:', error)
+    res.status(500).json({ error: 'Failed to update store' })
+  }
+})
+
+// Delete a store
+app.delete('/api/stores/:id', authenticateAdmin, async (req, res) => {
+  try {
+    const { id } = req.params
+    const store = await StoreDetail.findOne({ where: { store_id: id } })
+    if (!store) {
+      return res.status(404).json({ error: 'Store not found' })
+    }
+    await store.destroy()
+    res.json({ success: true, message: 'Store deleted successfully' })
+  } catch (error) {
+    console.error('Error deleting store:', error)
+    res.status(500).json({ error: 'Failed to delete store' })
+  }
+})
+
+// ── Billing CRUD (platform admin managed manual invoices) ──────────────────
+
+// Create a manual invoice
+app.post('/api/billing', authenticateAdmin, async (req, res) => {
+  try {
+    const { store_id, amount, due_date, status } = req.body
+    if (!store_id || amount === undefined || !due_date) {
+      return res.status(400).json({ error: 'store_id, amount and due_date are required' })
+    }
+    const bill = await Bill.create({
+      store_id,
+      url: '-',
+      trans_id: '-',
+      status: status || 'Pending',
+      tans_data: '',
+      due_date,
+      amount: parseFloat(amount),
+    })
+    res.json({ success: true, bill })
+  } catch (error) {
+    console.error('Error creating bill:', error)
+    res.status(500).json({ error: 'Failed to create bill' })
+  }
+})
+
+// Edit an invoice
+app.put('/api/billing/:id', authenticateAdmin, async (req, res) => {
+  try {
+    const { id } = req.params
+    const bill = await Bill.findOne({ where: { bill_id: id } })
+    if (!bill) {
+      return res.status(404).json({ error: 'Bill not found' })
+    }
+    const editable = ['amount', 'due_date', 'status']
+    const updates = {}
+    editable.forEach((field) => {
+      if (req.body[field] !== undefined) updates[field] = req.body[field]
+    })
+    await bill.update(updates)
+    res.json({ success: true, bill })
+  } catch (error) {
+    console.error('Error updating bill:', error)
+    res.status(500).json({ error: 'Failed to update bill' })
+  }
+})
+
+// Delete an invoice
+app.delete('/api/billing/:id', authenticateAdmin, async (req, res) => {
+  try {
+    const { id } = req.params
+    const bill = await Bill.findOne({ where: { bill_id: id } })
+    if (!bill) {
+      return res.status(404).json({ error: 'Bill not found' })
+    }
+    await bill.destroy()
+    res.json({ success: true, message: 'Bill deleted successfully' })
+  } catch (error) {
+    console.error('Error deleting bill:', error)
+    res.status(500).json({ error: 'Failed to delete bill' })
+  }
+})
+
+// ── Platform Admins CRUD ─────────────────────────────────────────────────
+
+// List all platform admins
+app.get('/api/admins', authenticateAdmin, async (req, res) => {
+  try {
+    const admins = await Admin.findAll({
+      attributes: ['id', 'email', 'username', 'role', 'createdAt'],
+      order: [['id', 'ASC']],
+    })
+    res.json({ admins })
+  } catch (error) {
+    console.error('Error fetching admins:', error)
+    res.status(500).json({ error: 'Failed to fetch admins' })
+  }
+})
+
+// Create another platform admin
+app.post('/api/admins', authenticateAdmin, async (req, res) => {
+  try {
+    const { email, username, password, role } = req.body
+    if (!email || !password) {
+      return res.status(400).json({ error: 'email and password are required' })
+    }
+    const existing = await Admin.findOne({ where: { email } })
+    if (existing) {
+      return res.status(400).json({ error: 'An admin with this email already exists' })
+    }
+    const hash = await bcrypt.hash(password, 10)
+    const admin = await Admin.create({ email, username: username || null, password: hash, role: role || 'admin' })
+    res.json({ success: true, admin: { id: admin.id, email: admin.email, username: admin.username, role: admin.role } })
+  } catch (error) {
+    console.error('Error creating admin:', error)
+    res.status(500).json({ error: 'Failed to create admin' })
+  }
+})
+
+// Edit a platform admin
+app.put('/api/admins/:id', authenticateAdmin, async (req, res) => {
+  try {
+    const { id } = req.params
+    const admin = await Admin.findOne({ where: { id } })
+    if (!admin) {
+      return res.status(404).json({ error: 'Admin not found' })
+    }
+    const updates = {}
+    if (req.body.email !== undefined) updates.email = req.body.email
+    if (req.body.username !== undefined) updates.username = req.body.username
+    if (req.body.role !== undefined) updates.role = req.body.role
+    if (req.body.password) updates.password = await bcrypt.hash(req.body.password, 10)
+
+    await admin.update(updates)
+    res.json({ success: true, admin: { id: admin.id, email: admin.email, username: admin.username, role: admin.role } })
+  } catch (error) {
+    console.error('Error updating admin:', error)
+    res.status(500).json({ error: 'Failed to update admin' })
+  }
+})
+
+// Delete a platform admin
+app.delete('/api/admins/:id', authenticateAdmin, async (req, res) => {
+  try {
+    const { id } = req.params
+
+    if (String(req.adminAuth.id) === String(id)) {
+      return res.status(400).json({ error: 'You cannot delete your own account' })
+    }
+
+    const totalAdmins = await Admin.count()
+    if (totalAdmins <= 1) {
+      return res.status(400).json({ error: 'Cannot delete the last remaining admin' })
+    }
+
+    const admin = await Admin.findOne({ where: { id } })
+    if (!admin) {
+      return res.status(404).json({ error: 'Admin not found' })
+    }
+    await admin.destroy()
+    res.json({ success: true, message: 'Admin deleted successfully' })
+  } catch (error) {
+    console.error('Error deleting admin:', error)
+    res.status(500).json({ error: 'Failed to delete admin' })
+  }
+})
+
+// ── Announcements CRUD ───────────────────────────────────────────────────
+
+// List all announcements (platform admin)
+app.get('/api/announcements', authenticateAdmin, async (req, res) => {
+  try {
+    const announcements = await Announcement.findAll({ order: [['id', 'DESC']] })
+    res.json({ announcements })
+  } catch (error) {
+    console.error('Error fetching announcements:', error)
+    res.status(500).json({ error: 'Failed to fetch announcements' })
+  }
+})
+
+// Create an announcement
+app.post('/api/announcements', authenticateAdmin, async (req, res) => {
+  try {
+    const { title, message, type, active } = req.body
+    if (!title || !message) {
+      return res.status(400).json({ error: 'title and message are required' })
+    }
+
+    if (active) {
+      await Announcement.update({ active: false }, { where: {} })
+    }
+
+    const announcement = await Announcement.create({
+      title,
+      message,
+      type: type || 'info',
+      active: Boolean(active),
+      created_by: req.adminAuth.id,
+    })
+    res.json({ success: true, announcement })
+  } catch (error) {
+    console.error('Error creating announcement:', error)
+    res.status(500).json({ error: 'Failed to create announcement' })
+  }
+})
+
+// Edit an announcement's content
+app.put('/api/announcements/:id', authenticateAdmin, async (req, res) => {
+  try {
+    const { id } = req.params
+    const announcement = await Announcement.findOne({ where: { id } })
+    if (!announcement) {
+      return res.status(404).json({ error: 'Announcement not found' })
+    }
+    const editable = ['title', 'message', 'type']
+    const updates = {}
+    editable.forEach((field) => {
+      if (req.body[field] !== undefined) updates[field] = req.body[field]
+    })
+    await announcement.update(updates)
+    res.json({ success: true, announcement })
+  } catch (error) {
+    console.error('Error updating announcement:', error)
+    res.status(500).json({ error: 'Failed to update announcement' })
+  }
+})
+
+// Activate/deactivate an announcement (only one can be active at a time)
+app.put('/api/announcements/:id/toggle-active', authenticateAdmin, async (req, res) => {
+  try {
+    const { id } = req.params
+    const { active } = req.body
+    if (active === undefined) {
+      return res.status(400).json({ error: 'active field is required' })
+    }
+
+    const announcement = await Announcement.findOne({ where: { id } })
+    if (!announcement) {
+      return res.status(404).json({ error: 'Announcement not found' })
+    }
+
+    if (active) {
+      await Announcement.update({ active: false }, { where: {} })
+    }
+    await announcement.update({ active: Boolean(active) })
+
+    res.json({
+      success: true,
+      message: `Announcement ${active ? 'activated' : 'deactivated'} successfully`,
+      announcement,
+    })
+  } catch (error) {
+    console.error('Error toggling announcement status:', error)
+    res.status(500).json({ error: 'Failed to toggle announcement status' })
+  }
+})
+
+// Delete an announcement
+app.delete('/api/announcements/:id', authenticateAdmin, async (req, res) => {
+  try {
+    const { id } = req.params
+    const announcement = await Announcement.findOne({ where: { id } })
+    if (!announcement) {
+      return res.status(404).json({ error: 'Announcement not found' })
+    }
+    await announcement.destroy()
+    res.json({ success: true, message: 'Announcement deleted successfully' })
+  } catch (error) {
+    console.error('Error deleting announcement:', error)
+    res.status(500).json({ error: 'Failed to delete announcement' })
+  }
+})
+
+// Public endpoint — fetch the currently active announcement (no auth; consumed by the merchant app)
+app.get('/api/announcements/active', async (req, res) => {
+  try {
+    const announcement = await Announcement.findOne({ where: { active: true }, order: [['id', 'DESC']] })
+    res.json({ announcement: announcement || null })
+  } catch (error) {
+    console.error('Error fetching active announcement:', error)
+    res.status(500).json({ error: 'Failed to fetch active announcement' })
+  }
+})
+
+// Duplicate a product
+app.post('/api/products/:id/duplicate', async (req, res) => {
+  const { id } = req.params;
+  const { newName, newSku, newMainImage, newGalleryImages } = req.body;
+
+  try {
+    // First, fetch the original product
+    const originalProductResponse = await axios.get(
+        `${ECDWID_API_URL}/${req.storeId}/products/${id}`,
+        { headers: { Authorization: `Bearer ${req.apiToken}` } }
+    );
+
+    const originalProduct = originalProductResponse.data;
+
+    // Build the duplicated product data
+    const duplicatedProduct = {
+      name: newName || `${originalProduct.name} (Copy)`,
+      description: originalProduct.description || '',
+      price: originalProduct.price,
+      compareToPrice: originalProduct.compareToPrice,
+      costPrice: originalProduct.costPrice,
+      sku: newSku || `${originalProduct.sku || 'product'}-${Date.now()}`,
+      quantity: originalProduct.quantity,
+      unlimited: originalProduct.unlimited,
+      enabled: originalProduct.enabled,
+      weight: originalProduct.weight,
+      width: originalProduct.width,
+      height: originalProduct.height,
+      depth: originalProduct.depth,
+      taxClassId: originalProduct.taxClassId,
+      categoryIds: originalProduct.categoryIds || [],
+      options: originalProduct.options || [],
+      combinations: originalProduct.combinations || [],
+      attributes: originalProduct.attributes || [],
+      seoTitle: originalProduct.seoTitle,
+      seoDescription: originalProduct.seoDescription,
+    };
+
+    // Remove read-only fields
+    delete duplicatedProduct.id;
+    delete duplicatedProduct.created;
+    delete duplicatedProduct.updated;
+    delete duplicatedProduct.url;
+    delete duplicatedProduct.thumbnailUrl;
+    delete duplicatedProduct.hdThumbnailUrl;
+    delete duplicatedProduct.originalImageUrl;
+    delete duplicatedProduct.productClassId;
+    delete duplicatedProduct.createdTimestamp;
+    delete duplicatedProduct.updatedTimestamp;
+    delete duplicatedProduct.defaultDisplayedPriceFormatted;
+    delete duplicatedProduct.smallThumbnailUrl;
+
+    // Create the new product
+    const newProductResponse = await axios.post(
+        `${ECDWID_API_URL}/${req.storeId}/products`,
+        duplicatedProduct,
+        { headers: { Authorization: `Bearer ${req.apiToken}` } }
+    );
+
+    const newProductId = newProductResponse.data.id;
+
+    // Handle images: Use custom images if provided, otherwise copy from original
+    let mainImageUploaded = false;
+
+    // Handle main image - use custom if provided
+    if (newMainImage && newMainImage.trim()) {
+      try {
+        // Upload custom main image
+        await axios.post(
+            `${ECDWID_API_URL}/${req.storeId}/products/${newProductId}/image/async`,
+            { url: newMainImage, width: 2500, height: 2500 },
+            { headers: { Authorization: `Bearer ${req.apiToken}` } }
+        );
+        mainImageUploaded = true;
+        console.log("Custom main image uploaded successfully");
+      } catch (imageError) {
+        console.warn("Custom main image upload failed:", imageError.message);
+      }
+    }
+
+    // If no custom main image and original has an image, copy it
+    if (!mainImageUploaded && originalProduct.originalImageUrl) {
+      try {
+        await axios.post(
+            `${ECDWID_API_URL}/${req.storeId}/products/${newProductId}/image/async`,
+            { url: originalProduct.originalImageUrl, width: 2500, height: 2500 },
+            { headers: { Authorization: `Bearer ${req.apiToken}` } }
+        );
+        console.log("Original main image copied successfully");
+      } catch (imageError) {
+        console.warn("Main image copy failed:", imageError.message);
+      }
+    }
+
+    // Handle gallery images - use custom if provided
+    if (newGalleryImages && newGalleryImages.length > 0) {
+      console.log(`Uploading ${newGalleryImages.length} custom gallery images`);
+
+      // Upload each custom gallery image
+      for (const galleryUrl of newGalleryImages) {
+        if (galleryUrl && galleryUrl.trim()) {
+          try {
+            await axios.post(
+                `${ECDWID_API_URL}/${req.storeId}/products/${newProductId}/gallery/async`,
+                { url: galleryUrl, width: 2500, height: 2500 },
+                { headers: { Authorization: `Bearer ${req.apiToken}` } }
+            );
+            console.log("Custom gallery image uploaded:", galleryUrl);
+          } catch (error) {
+            console.warn("Failed to upload custom gallery image:", error.message);
+          }
+        }
+      }
+    }
+    // If no custom gallery images and original has gallery images, copy them
+    else if (originalProduct.galleryImages && originalProduct.galleryImages.length > 0) {
+      console.log(`Copying ${originalProduct.galleryImages.length} original gallery images`);
+
+      for (const galleryImage of originalProduct.galleryImages) {
+        if (galleryImage.url) {
+          try {
+            await axios.post(
+                `${ECDWID_API_URL}/${req.storeId}/products/${newProductId}/gallery/async`,
+                { url: galleryImage.url, width: 2500, height: 2500 },
+                { headers: { Authorization: `Bearer ${req.apiToken}` } }
+            );
+            console.log("Original gallery image copied:", galleryImage.url);
+          } catch (error) {
+            console.warn("Failed to copy gallery image:", error.message);
+          }
+        }
+      }
+    }
+
+    // Fetch the newly created product to return complete details
+    const newProduct = await axios.get(
+        `${ECDWID_API_URL}/${req.storeId}/products/${newProductId}`,
+        { headers: { Authorization: `Bearer ${req.apiToken}` } }
+    );
+
+    // Create notification
+    await Notification.create({
+      details: `Product "${originalProduct.name}" was duplicated as "${newProduct.data.name}"`,
+      read_flag: false,
+      store_id: req.storeId,
+    });
+
+    res.json({
+      success: true,
+      message: 'Product duplicated successfully',
+      originalProductId: parseInt(id),
+      newProduct: newProduct.data,
+      editUrl: `/api/products/${newProductId}/edit-json`
+    });
+
+  } catch (error) {
+    console.error('Error duplicating product:', error);
+    handleApiError(error, res);
+  }
+});
+
+// Get product data as JSON for editing
+app.get('/api/products/:id/edit-json', async (req, res) => {
+  const { id } = req.params;
+
+  try {
+    // Fetch the product from Ecwid
+    const productResponse = await axios.get(
+        `${ECDWID_API_URL}/${req.storeId}/products/${id}`,
+        { headers: { Authorization: `Bearer ${req.apiToken}` } }
+    );
+
+    const product = productResponse.data;
+
+    // Create a clean, editable JSON structure
+    const editableProduct = {
+      // Basic Information
+      id: product.id,
+      name: product.name,
+      description: product.description || '',
+      price: product.price,
+      compareToPrice: product.compareToPrice || null,
+      costPrice: product.costPrice || null,
+      sku: product.sku || '',
+
+      // Inventory
+      quantity: product.quantity || 0,
+      unlimited: product.unlimited || false,
+      inStock: product.inStock || true,
+
+      // Visibility
+      enabled: product.enabled || true,
+
+      // Shipping
+      weight: product.weight || 0,
+      width: product.width || 0,
+      height: product.height || 0,
+      depth: product.depth || 0,
+      freeShipping: product.freeShipping || false,
+      shippingOnlyRecalculate: product.shippingOnlyRecalculate || false,
+
+      // Tax
+      taxClassId: product.taxClassId || 0,
+
+      // Categories
+      categoryIds: product.categoryIds || [],
+
+      // Images
+      originalImageUrl: product.originalImageUrl || null,
+      thumbnailUrl: product.thumbnailUrl || null,
+      galleryImages: product.galleryImages || [],
+
+      // Options (for product customization)
+      options: (product.options || []).map(option => ({
+        id: option.id,
+        name: option.name,
+        type: option.type,
+        required: option.required || false,
+        choices: option.choices || [],
+        defaultValue: option.defaultValue || null
+      })),
+
+      // Variations/Combinations
+      combinations: (product.combinations || []).map(combination => ({
+        id: combination.id,
+        options: combination.options || [],
+        sku: combination.sku || '',
+        price: combination.price || 0,
+        quantity: combination.quantity || 0,
+        unlimited: combination.unlimited || false
+      })),
+
+      // Attributes (additional product properties)
+      attributes: product.attributes || [],
+
+      // SEO Metadata
+      seoTitle: product.seoTitle || '',
+      seoDescription: product.seoDescription || '',
+
+      // URLs
+      pageUrl: product.pageUrl || '',
+      productUrl: product.productUrl || '',
+
+      // Additional Info
+      defaultCombinationId: product.defaultCombinationId || 0,
+      defaultCategoryId: product.defaultCategoryId || null,
+      brand: product.brand || null,
+
+      // Metadata for editing
+      _meta: {
+        lastUpdated: product.updated,
+        created: product.created,
+        productType: product.productType || 'physical',
+        editable: true,
+        apiEndpoint: `/api/products/${id}`,
+        availableMethods: ['PUT', 'DELETE']
+      }
+    };
+
+    res.json({
+      success: true,
+      product: editableProduct,
+      rawProduct: product // Include raw product data if needed
+    });
+
+  } catch (error) {
+    console.error('Error fetching product for editing:', error);
+    handleApiError(error, res);
+  }
+});
+
+
+// Webhook endpoint
+app.post('/api/webhook', async (req, res) => {
+  console.log('Webhook received:', req.body);
+
+  const eventData = req.body;
+
+  try {
+    if (eventData.eventType === 'product.updated') {
+      const accessToken = await bundleStockService.resolveAccessToken(eventData.storeId);
+      if (!accessToken) {
+        console.error(`No token found for storeId: ${eventData.storeId}`);
+        return res.status(404).json({ error: 'Token not found' });
+      }
+
+      // A bundle's own Ecwid product can itself be the entity that changed
+      // (e.g. someone edited it directly in Ecwid) - skip re-syncing in that
+      // case to avoid acting on stale/self-triggered data.
+      const selfBundle = await Bundle.findOne({ where: { ecwid_id: eventData.entityId, store_id: eventData.storeId } });
+      if (selfBundle) {
+        return res.status(200).send('Webhook skipped (bundle product itself).');
+      }
+
+      const affectedBundles = await bundleStockService.findBundlesContainingProduct(eventData.storeId, eventData.entityId);
+
+      if (affectedBundles.length > 0) {
+        await Promise.all(
+          affectedBundles.map((bundle) => bundleStockService.syncBundleStock(eventData.storeId, bundle, accessToken))
+        );
+      } else {
+        // Plain (non-bundled) product - just check for a low-stock notification.
+        const productDetail = await bundleStockService.getEcwidProduct(eventData.storeId, eventData.entityId, accessToken);
+        if (!productDetail.unlimited && productDetail.quantity < 2) {
+          const details = productDetail.quantity === 0
+            ? `${productDetail.name} is out of stock`
+            : `Stock status of ${productDetail.name} has reduced to 1`;
+          await Notification.create({ details, read_flag: false, store_id: eventData.storeId });
+        }
+      }
+
+      return res.status(200).send('Webhook processed successfully');
+    }
+
+    if (eventData.eventType === 'order.updated') {
+      const { orderId, oldPaymentStatus, newPaymentStatus } = eventData.data;
+
+      if (oldPaymentStatus !== 'AWAITING_PAYMENT' || newPaymentStatus !== 'PAID') {
+        return res.status(200).send('Webhook skipped (unhandled status transition).');
+      }
+
+      const accessToken = await bundleStockService.resolveAccessToken(eventData.storeId);
+      if (!accessToken) {
+        console.error(`No token found for storeId: ${eventData.storeId}`);
+        return res.status(404).json({ error: 'Token not found' });
+      }
+
+      const orderDetails = await axios.get(`${ECDWID_API_URL}/${eventData.storeId}/orders/${orderId}`, {
+        headers: { Authorization: `Bearer ${accessToken}` }
+      });
+
+      // Bundles whose stock needs resyncing after this order, deduped by id.
+      const bundlesToResync = new Map();
+      // Per-bundle "child variant chosen" summaries, surfaced in the order-paid notification below.
+      const bundleSelections = [];
+
+      await Promise.all(orderDetails.data.items.map(async (orderItem) => {
+        const bundle = await Bundle.findOne({ where: { ecwid_id: orderItem.productId, store_id: eventData.storeId } });
+
+        if (bundle) {
+          // A bundle was sold directly - decrement each child by qty * orderQty, then resync.
+          await bundleStockService.decrementChildrenForSale(eventData.storeId, bundle, orderItem.quantity, accessToken);
+          bundlesToResync.set(bundle.id, bundle);
+
+          // Other bundles sharing the same children also need resyncing.
+          const children = parseChildren(bundle);
+          const siblingLists = await Promise.all(
+            children.map((child) => bundleStockService.findBundlesContainingProduct(eventData.storeId, child.productId))
+          );
+          siblingLists.flat().forEach((sibling) => bundlesToResync.set(sibling.id, sibling));
+
+          // Capture which sub-product variants the customer picked (mirrored
+          // Options created by buildMirroredOptions), so fulfillment knows
+          // what to pack without opening the order in Ecwid.
+          const selected = (orderItem.selectedOptions || [])
+            .map((opt) => `${opt.name}: ${opt.value}`)
+            .join(', ');
+          if (selected) {
+            bundleSelections.push(`${bundle.name} → ${selected}`);
+          }
+        } else {
+          // A plain child product was sold directly - any bundles containing it need resyncing.
+          const containingBundles = await bundleStockService.findBundlesContainingProduct(eventData.storeId, orderItem.productId);
+          containingBundles.forEach((b) => bundlesToResync.set(b.id, b));
+        }
+      }));
+
+      await Promise.all(
+        Array.from(bundlesToResync.values()).map((bundle) => bundleStockService.syncBundleStock(eventData.storeId, bundle, accessToken))
+      );
+
+      const detailsSuffix = bundleSelections.length > 0 ? ` (${bundleSelections.join('; ')})` : '';
+      await Notification.create({
+        details: `Order #${orderId} has been paid${detailsSuffix}`,
+        read_flag: false,
+        store_id: eventData.storeId,
+      });
+
+      return res.status(200).send('Webhook processed successfully');
+    }
+
+    return res.status(200).send('Webhook skipped...');
+  } catch (error) {
+    console.error('Error processing webhook:', error);
+    return res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+routes.configure(app);
+
+// Error handling function for API calls
+function handleApiError(error, res) {
+  if (error.response) {
+    res.status(error.response.status).json(error.response.data);
+  } else if (error.request) {
+    res.status(500).json({ error: 'No response received from Ecwid' });
+  } else {
+    res.status(500).json({ error: error.message });
+  }
+}
+
+// Create HTTPS server
+const httpsServer = https.createServer(sslOptions, app);
+httpsServer.listen(HTTPS_PORT || 3339, () => {
+  console.log(`HTTPS Server running on port ${HTTPS_PORT || 3339}`);
+});
+
+// Start HTTP server
+app.listen(PORT || 3338, () => {
+  console.log(`HTTP Server running on port ${PORT || 3338}`);
+});
