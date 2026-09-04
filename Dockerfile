@@ -1,14 +1,14 @@
 FROM node:22
 
-WORKDIR /app/backend
+WORKDIR /app
 
-COPY backend/package*.json ./
+COPY package*.json ./
 
 RUN npm install
 
 RUN npm install -g pm2
 
-COPY backend/ ./
+COPY . .
 
 EXPOSE 3338
 EXPOSE 3339
