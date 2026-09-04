@@ -1,13 +1,18 @@
-FROM node:22
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
 
-WORKDIR /app/backend
+    restart: unless-stopped
 
-COPY backend/package*.json ./
+    ports:
+      - "3338:3010"
+      - "3339:3010"
 
-RUN npm install
+    environment:
+      NODE_ENV: production
+      PORT: 3010
+      HOST: 0.0.0.0
 
-COPY backend/ ./
-
-EXPOSE 3010
-
-CMD ["npx", "pm2-runtime", "start", "index.js", "-i", "3"]
+    command: pm2-runtime start index.js -i 3
